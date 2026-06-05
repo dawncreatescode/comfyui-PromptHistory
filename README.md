@@ -42,7 +42,7 @@ Restart ComfyUI. No extra Python packages are required.
 | `history_paths` | string | Newline-separated list of history file paths |
 | `save_to_path` | string | File that receives new prompts |
 | `active_paths` | JSON | Array of paths currently used for random/sequential |
-| `max_entries` | integer | Max prompts per file (default: 500 000) |
+| `max_entries` | integer | Max prompts per file |
 
 ### Outputs
 
