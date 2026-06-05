@@ -22,7 +22,7 @@ Search for **Prompt History** in the ComfyUI Manager custom node browser and ins
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/YOUR_USERNAME/comfyui-PromptHistory
+git clone https://github.com/dawncreatescode/comfyui-PromptHistory
 ```
 
 Restart ComfyUI. No extra Python packages are required.
