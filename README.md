@@ -6,7 +6,7 @@ A ComfyUI custom node for saving, searching, and reusing prompts across sessions
 
 - **Persistent history** — prompts are saved to JSON files and survive restarts
 - **Multiple history files** — manage separate collections (e.g. per-project or per-style)
-- **Full-text search** — real-time search with case-sensitive, whole-word, and regex modes
+- **Text search** — real-time search with case-sensitive, whole-word, and regex modes
 - **Three operating modes** — edit a prompt manually, pick one randomly, or cycle sequentially
 - **Deduplication** — identical prompts are merged; reuse increments a hit counter
 - **Batch queue** — select multiple prompts and queue them as separate workflow runs
