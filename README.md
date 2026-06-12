@@ -11,7 +11,9 @@ Never lose a good prompt again. This extension adds two **Select Prompt From His
 - **Deduplication** — identical prompts are merged; reusing one bumps its hit counter so favorites surface
 - **Batch queue** — tick several prompts and queue them as separate runs in one click
 - **Optional CLIP encoding** — connect a CLIP model and the node outputs conditioning directly, replacing a CLIP Text Encode node
-  
+
+![node screenshot](prompthistory.png)
+
 ## Installation
 
 ### ComfyUI Manager (recommended)
