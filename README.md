@@ -12,7 +12,7 @@ Never lose a good prompt again. This extension adds two **Select Prompt From His
 - **Batch queue** — tick several prompts and queue them as separate runs in one click
 - **Optional CLIP encoding** — connect a CLIP model and the node outputs conditioning directly, replacing a CLIP Text Encode node
 
-![node screenshot](prompthistory.png)
+![node screenshot](prompthistory.png) ![node screenshot](promptHistoryHistory.png)
 
 ## Installation
 
