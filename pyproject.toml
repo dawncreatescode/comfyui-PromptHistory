@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-PromptHistory"
-version = "1.0.0"
+version = "1.0.1"
 description = "ComfyUI custom node for saving, searching, and reusing prompts across sessions."
 license = { text = "MIT" }
 requires-python = ">=3.9"
