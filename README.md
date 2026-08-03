@@ -58,7 +58,8 @@ For `random` and `sequential`, which files are drawn from is can be toggled in t
 
 Click **Select Prompts…** on the node to open it.
 
-- **Search** filters as you type.
+- **Search** filters as you type, with case-sensitive, whole-word, and regex toggles.
+- **Search scope** (pair node only) — a dropdown next to the search toggles chooses whether the query matches the positive prompt (default), the negative prompt, or both.
 - **Click a prompt** to load it into the node's `text` widget.
 - **Checkboxes + Queue N** queue each checked prompt as its own workflow run — an easy way to render a shortlist of candidates back-to-back.
 - **Manage Files…** adds, removes, or discovers history files, and selects which file new prompts are saved to.

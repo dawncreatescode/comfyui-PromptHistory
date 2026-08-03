@@ -57,23 +57,101 @@ function escHtml(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function highlightSimple(text, query) {
-    if (!query) return escHtml(text);
-    try {
-        const re = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
-        return escHtml(text).replace(re, m => `<mark class="pph-highlight">${m}</mark>`);
-    } catch {
-        return escHtml(text);
+function escapeRegex(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseQuery(raw) {
+    const terms = [];
+    for (const m of raw.matchAll(/"([^"]+)"|(\S+)/g)) {
+        const text = (m[1] ?? m[2]).trim();
+        if (text) terms.push({ text, quoted: !!m[1] });
     }
+    return terms;
+}
+
+function buildPatterns(terms, opts) {
+    return terms.flatMap(({ text, quoted }) => {
+        try {
+            const flags = opts.caseSensitive ? "g" : "gi";
+            if (opts.useRegex && !quoted) {
+                return [new RegExp(text, flags)];
+            }
+            const pat = (opts.wholeWord && !quoted)
+                ? new RegExp("\\b" + escapeRegex(text) + "\\b", flags)
+                : new RegExp(escapeRegex(text), flags);
+            return [pat];
+        } catch { return []; }
+    });
+}
+
+function textMatchesTerm(text, q, quoted, opts) {
+    try {
+        if (opts.useRegex && !quoted) {
+            return new RegExp(q, opts.caseSensitive ? "" : "i").test(text);
+        }
+        if (opts.wholeWord && !quoted) {
+            return new RegExp("\\b" + escapeRegex(q) + "\\b", opts.caseSensitive ? "" : "i").test(text);
+        }
+        const needle = opts.caseSensitive ? q : q.toLowerCase();
+        const hay    = opts.caseSensitive ? text : text.toLowerCase();
+        return hay.includes(needle);
+    } catch { return false; }
+}
+
+// Every term must match at least one of the in-scope fields of the pair.
+function pairMatchesAll(item, terms, opts) {
+    const fields = [];
+    if (opts.searchIn !== "negative") fields.push(item.positive ?? "");
+    if (opts.searchIn !== "positive") fields.push(item.negative ?? "");
+    return terms.every(({ text: q, quoted }) =>
+        fields.some(f => textMatchesTerm(f, q, quoted, opts))
+    );
+}
+
+function highlightHtml(text, patterns) {
+    if (!patterns || !patterns.length) return escHtml(text);
+    try {
+        const ranges = [];
+        for (const re of patterns) {
+            re.lastIndex = 0;
+            for (const m of text.matchAll(re)) {
+                if (m[0].length) ranges.push([m.index, m.index + m[0].length]);
+            }
+        }
+        ranges.sort((a, b) => a[0] - b[0]);
+        const merged = [];
+        for (const r of ranges) {
+            const last = merged.at(-1);
+            if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+            else merged.push([...r]);
+        }
+        let out = "", pos = 0;
+        for (const [s, e] of merged) {
+            out += escHtml(text.slice(pos, s));
+            out += `<mark class="pph-highlight">${escHtml(text.slice(s, e))}</mark>`;
+            pos = e;
+        }
+        return out + escHtml(text.slice(pos));
+    } catch { return escHtml(text); }
 }
 
 // ─── API ───────────────────────────────────────────────────────────────────
 
-async function apiList(paths, query = "", sortBy = "recent") {
+async function apiList(paths, query = "", opts = {}) {
     const res = await fetch("/prompt_pair_history/list", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ history_paths: paths, query, sort_by: sortBy, max_results: 300 }),
+        body: JSON.stringify({
+            history_paths:  paths,
+            query,
+            case_sensitive: opts.caseSensitive ?? false,
+            whole_word:     opts.wholeWord     ?? false,
+            use_regex:      opts.useRegex      ?? false,
+            search_in:      opts.searchIn      ?? "positive",
+            sort_by:        opts.sortBy        ?? "recent",
+            max_results:    opts.maxResults    ?? 300,
+        }),
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
@@ -208,18 +286,29 @@ function injectCSS() {
 }
 .pph-search:focus { border-color: #6a8aaa; }
 
-/* ── Sort ── */
+/* ── Option toggles + scope + sort ── */
 .pph-opts-row {
     display: flex; gap: 4px; margin-bottom: 10px;
-    flex-wrap: wrap; align-items: center; justify-content: flex-end;
+    flex-wrap: wrap; align-items: center;
 }
-.pph-sort {
+.pph-toggle {
+    padding: 3px 10px; font-size: 11px; cursor: pointer;
+    background: var(--comfy-input-bg, #2b2b2b);
+    border: 1px solid var(--border-color, #555);
+    color: var(--comfy-text, #bbb);
+    border-radius: 6px; white-space: nowrap;
+    transition: background 0.12s, border-color 0.12s;
+}
+.pph-toggle:hover  { filter: brightness(1.18); }
+.pph-toggle.active { background: #1e4a7a; border-color: #4a7aaa; color: #cde; }
+.pph-scope, .pph-sort {
     padding: 3px 8px; font-size: 11px;
     background: var(--comfy-input-bg, #2b2b2b);
     border: 1px solid var(--border-color, #555);
     color: var(--comfy-text, #ddd);
     border-radius: 6px; cursor: pointer; outline: none;
 }
+.pph-sort { margin-left: auto; }
 
 /* ── Content area ── */
 .pph-content { display: flex; flex: 1; min-height: 0; overflow: hidden; }
@@ -517,7 +606,15 @@ function openPanel(node) {
     let items       = [];
     let selectedIdx = -1;
     let searchTimer = null;
-    let sortBy      = "recent";
+    let currentPatterns = [];
+
+    const opts = {
+        caseSensitive: false,
+        wholeWord:     false,
+        useRegex:      false,
+        searchIn:      "positive",
+        sortBy:        "recent",
+    };
 
     if (!node.__pph_queue) node.__pph_queue = { selected: new Set(), items: new Map() };
     const queueSelected = node.__pph_queue.selected;
@@ -624,21 +721,52 @@ function openPanel(node) {
     const searchRow = el("div", "pph-search-row");
     const searchEl  = el("input", "pph-search");
     searchEl.type = "text";
-    searchEl.placeholder = "Search positive or negative…";
     searchEl.autocomplete = "off";
     searchEl.spellcheck = false;
     searchRow.appendChild(searchEl);
 
-    // Sort
+    function syncSearchPlaceholder() {
+        searchEl.placeholder = {
+            positive: "Search positive prompts…",
+            negative: "Search negative prompts…",
+            both:     "Search positive or negative…",
+        }[opts.searchIn];
+    }
+    syncSearchPlaceholder();
+
+    // Option toggles + scope + sort
     const optsRow = el("div", "pph-opts-row");
+    function makeToggle(label, title, key) {
+        const b = document.createElement("button");
+        b.className = "pph-toggle"; b.textContent = label; b.title = title;
+        b.onclick = () => { opts[key] = !opts[key]; b.classList.toggle("active", opts[key]); doSearch(); };
+        return b;
+    }
+    const caseTgl = makeToggle("Aa",      "Case Sensitive", "caseSensitive");
+    const wordTgl = makeToggle("\\bW\\b", "Whole Word",     "wholeWord");
+    const rxTgl   = makeToggle(".*",      "Regex",          "useRegex");
+
+    const scopeSel = el("select", "pph-scope");
+    scopeSel.title = "Which prompt of the pair to search";
+    [["positive", "Positive"], ["negative", "Negative"], ["both", "Both"]].forEach(([v, lbl]) => {
+        const o = document.createElement("option");
+        o.value = v; o.textContent = lbl;
+        scopeSel.appendChild(o);
+    });
+    scopeSel.onchange = () => {
+        opts.searchIn = scopeSel.value;
+        syncSearchPlaceholder();
+        doSearch();
+    };
+
     const sortSel = el("select", "pph-sort");
     [["recent", "↓ Recent"], ["alpha", "A–Z"], ["hits", "↑ Most Used"]].forEach(([v, lbl]) => {
         const o = document.createElement("option");
         o.value = v; o.textContent = lbl;
         sortSel.appendChild(o);
     });
-    sortSel.onchange = () => { sortBy = sortSel.value; doSearch(); };
-    optsRow.appendChild(sortSel);
+    sortSel.onchange = () => { opts.sortBy = sortSel.value; doSearch(); };
+    optsRow.append(caseTgl, wordTgl, rxTgl, scopeSel, sortSel);
 
     header.append(titleRow, sourcesRow, savetoRow, searchRow, optsRow);
 
@@ -670,12 +798,15 @@ function openPanel(node) {
         overlay.remove();
     }
 
+    // Highlight only the fields the search scope actually covers
+    function posPatterns() { return opts.searchIn !== "negative" ? currentPatterns : []; }
+    function negPatterns() { return opts.searchIn !== "positive" ? currentPatterns : []; }
+
     // ── Preview ──
     function showPreview(item) {
         if (!item) { previewBox.innerHTML = ""; return; }
-        const query = searchEl.value.trim();
-        const posHtml = highlightSimple(item.positive || "", query);
-        const negHtml = highlightSimple(item.negative || "", query);
+        const posHtml = highlightHtml(item.positive || "", posPatterns());
+        const negHtml = highlightHtml(item.negative || "", negPatterns());
         previewBox.innerHTML =
             `<div class="pph-preview-pos"><div class="pph-preview-label">Positive</div><div class="pph-preview-text">${posHtml}</div></div>` +
             `<div class="pph-preview-neg"><div class="pph-preview-label">Negative</div><div class="pph-preview-text">${negHtml || '<em style="opacity:0.35">empty</em>'}</div></div>`;
@@ -707,7 +838,6 @@ function openPanel(node) {
         }
 
         totalEl.textContent = `${items.length} pair${items.length !== 1 ? "s" : ""}`;
-        const query = searchEl.value.trim();
 
         items.forEach((item, idx) => {
             const row = el("div", "pph-row");
@@ -728,12 +858,12 @@ function openPanel(node) {
             const main = el("div", "pph-row-main");
 
             const posLine = el("div", "pph-row-pos");
-            posLine.innerHTML = highlightSimple(item.positive_preview || item.positive?.slice(0, 100) || "", query);
+            posLine.innerHTML = highlightHtml(item.positive_preview || item.positive?.slice(0, 100) || "", posPatterns());
 
             const negCls = item.negative ? "pph-row-neg" : "pph-row-neg pph-row-neg-empty";
             const negLine = el("div", negCls);
             negLine.innerHTML = item.negative
-                ? highlightSimple(item.negative_preview || item.negative?.slice(0, 100) || "", query)
+                ? highlightHtml(item.negative_preview || item.negative?.slice(0, 100) || "", negPatterns())
                 : "no negative";
 
             const meta  = el("div", "pph-row-meta");
@@ -831,9 +961,19 @@ function openPanel(node) {
             totalEl.textContent = "";
             return;
         }
-        apiList(paths, searchEl.value.trim(), sortBy)
+        const raw       = searchEl.value;
+        const terms     = parseQuery(raw);
+        currentPatterns = buildPatterns(terms, opts);
+        // Multi-term queries are filtered client-side (the backend matches the
+        // raw string as one query); fetch a larger window so filtering has data.
+        const multiTerm    = terms.length > 1;
+        const backendQuery = multiTerm ? "" : raw.trim();
+        const backendOpts  = multiTerm ? { ...opts, maxResults: 5000 } : opts;
+        apiList(paths, backendQuery, backendOpts)
             .then(data => {
-                items = data.items ?? [];
+                let results = data.items ?? [];
+                if (multiTerm) results = results.filter(it => pairMatchesAll(it, terms, opts));
+                items = results;
                 if (selectedIdx >= items.length) selectedIdx = -1;
                 renderList();
             })

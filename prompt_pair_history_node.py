@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import threading
 import time
 from typing import Any, Dict, List
@@ -100,6 +101,33 @@ def _build_preview(text: str, max_chars: int = 100) -> str:
     if len(flat) > max_chars:
         flat = flat[:max_chars].rstrip() + "…"
     return flat
+
+
+def _build_matcher(
+    query: str,
+    *,
+    case_sensitive: bool = False,
+    whole_word: bool = False,
+    use_regex: bool = False,
+):
+    """Return a callable(text) -> bool for the query. Mirrors the single-prompt
+    node's _search_items matching rules (substring / whole word / regex)."""
+    try:
+        if use_regex:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            pat = re.compile(query, flags)
+            return lambda text: bool(pat.search(text))
+        if whole_word:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            pat = re.compile(r"\b" + re.escape(query) + r"\b", flags)
+            return lambda text: bool(pat.search(text))
+        if case_sensitive:
+            return lambda text: query in text
+        q_lower = query.lower()
+        return lambda text: q_lower in text.lower()
+    except re.error:
+        q_fb = query if case_sensitive else query.lower()
+        return lambda text: q_fb in (text if case_sensitive else text.lower())
 
 
 def _upsert_pair(
@@ -295,6 +323,12 @@ def _register_pair_routes() -> None:
             body = await request.json()
             history_paths: List[str] = body.get("history_paths", [])
             query    = body.get("query", "").strip()
+            case_sensitive = bool(body.get("case_sensitive", False))
+            whole_word     = bool(body.get("whole_word", False))
+            use_regex      = bool(body.get("use_regex", False))
+            search_in      = body.get("search_in", "positive")
+            if search_in not in ("positive", "negative", "both"):
+                search_in = "positive"
             sort_by  = body.get("sort_by", "recent")
             max_results = int(body.get("max_results", 300))
 
@@ -318,12 +352,21 @@ def _register_pair_routes() -> None:
                 merged.sort(key=lambda x: x.get("ts", ""), reverse=True)
 
             if query:
-                q_lower = query.lower()
-                merged = [
-                    it for it in merged
-                    if q_lower in it.get("positive", "").lower()
-                    or q_lower in it.get("negative", "").lower()
-                ]
+                matcher = _build_matcher(
+                    query,
+                    case_sensitive=case_sensitive,
+                    whole_word=whole_word,
+                    use_regex=use_regex,
+                )
+
+                def _entry_matches(it: Dict[str, Any]) -> bool:
+                    if search_in in ("positive", "both") and matcher(it.get("positive", "")):
+                        return True
+                    if search_in in ("negative", "both") and matcher(it.get("negative", "")):
+                        return True
+                    return False
+
+                merged = [it for it in merged if _entry_matches(it)]
 
             results = merged[:max_results]
 
