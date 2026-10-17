@@ -39,7 +39,9 @@ except ImportError:
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _COMFY_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_DEFAULT_PAIR_HISTORY_PATH = "custom_nodes/comfyui-PromptHistory/history/prompt_pair_history.json"
+# See select_prompt_history_node.py: derive the node folder from the real install location.
+_NODE_DIR_REL = os.path.relpath(_HERE, _COMFY_ROOT).replace(os.sep, "/")
+_DEFAULT_PAIR_HISTORY_PATH = f"{_NODE_DIR_REL}/history/prompt_pair_history.json"
 _PAIR_LOCK = threading.Lock()
 
 
@@ -51,6 +53,19 @@ def _resolve_path(path: str) -> str:
     if os.path.isabs(path):
         return path
     return os.path.join(_COMFY_ROOT, path)
+
+
+def _history_path_error(path: Any) -> str | None:
+    """Return a reason the HTTP endpoints must refuse to write to ``path``, else None.
+
+    The endpoints accept arbitrary paths from the browser; limiting writes to
+    .json files keeps them from overwriting unrelated files on the server.
+    """
+    if not isinstance(path, str) or not path.strip():
+        return "history_path is empty"
+    if not path.strip().lower().endswith(".json"):
+        return "history_path must point to a .json file"
+    return None
 
 
 def _load_pair_history(path: str) -> List[Dict[str, Any]]:
@@ -400,6 +415,9 @@ def _register_pair_routes() -> None:
             max_entries = int(body.get("max_entries", 500_000))
             if not positive and not negative:
                 return web.json_response({"ok": False, "error": "empty pair"}, status=400)
+            err = _history_path_error(path)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
             with _PAIR_LOCK:
                 _save_pair_history(path, _upsert_pair(_load_pair_history(path), positive, negative, max_entries=max_entries))
             return web.json_response({"ok": True})
@@ -412,6 +430,9 @@ def _register_pair_routes() -> None:
             body = await request.json()
             path = body.get("history_path", _DEFAULT_PAIR_HISTORY_PATH)
             key  = body.get("key", "")
+            err = _history_path_error(path)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
             with _PAIR_LOCK:
                 items = [x for x in _load_pair_history(path) if x.get("key") != key]
                 _save_pair_history(path, items)
@@ -424,6 +445,9 @@ def _register_pair_routes() -> None:
         try:
             body = await request.json()
             path = body.get("history_path", _DEFAULT_PAIR_HISTORY_PATH)
+            err = _history_path_error(path)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
             with _PAIR_LOCK:
                 _save_pair_history(path, [])
             return web.json_response({"ok": True})

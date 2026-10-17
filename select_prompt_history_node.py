@@ -42,7 +42,11 @@ except ImportError:
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _COMFY_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_DEFAULT_HISTORY_PATH = "custom_nodes/comfyui-PromptHistory/history/prompt_history.json"
+# Relative history paths are resolved against the ComfyUI root. The node folder
+# segment is derived from where this package actually lives rather than
+# hardcoded, because registry / Manager installs may lowercase or rename it.
+_NODE_DIR_REL = os.path.relpath(_HERE, _COMFY_ROOT).replace(os.sep, "/")
+_DEFAULT_HISTORY_PATH = f"{_NODE_DIR_REL}/history/prompt_history.json"
 _HIST_LOCK = threading.Lock()
 
 
@@ -54,6 +58,19 @@ def _resolve_path(path: str) -> str:
     if os.path.isabs(path):
         return path
     return os.path.join(_COMFY_ROOT, path)
+
+
+def _history_path_error(path: Any) -> str | None:
+    """Return a reason the HTTP endpoints must refuse to write to ``path``, else None.
+
+    The endpoints accept arbitrary paths from the browser; limiting writes to
+    .json files keeps them from overwriting unrelated files on the server.
+    """
+    if not isinstance(path, str) or not path.strip():
+        return "history_path is empty"
+    if not path.strip().lower().endswith(".json"):
+        return "history_path must point to a .json file"
+    return None
 
 
 def _load_history(path: str) -> List[Dict[str, Any]]:
@@ -379,12 +396,12 @@ def _register_select_routes() -> None:
             files = []
             for fname in sorted(os.listdir(_HERE)):
                 if fname.lower().endswith(".json") and not fname.startswith("_"):
-                    files.append(f"custom_nodes/comfyui-PromptHistory/{fname}")
+                    files.append(f"{_NODE_DIR_REL}/{fname}")
             history_dir = os.path.join(_HERE, "history")
             if os.path.isdir(history_dir):
                 for fname in sorted(os.listdir(history_dir)):
                     if fname.lower().endswith(".json") and not fname.startswith("_"):
-                        files.append(f"custom_nodes/comfyui-PromptHistory/history/{fname}")
+                        files.append(f"{_NODE_DIR_REL}/history/{fname}")
             return web.json_response({"ok": True, "files": files})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
@@ -398,6 +415,9 @@ def _register_select_routes() -> None:
             max_entries = int(body.get("max_entries", 500_000))
             if not text:
                 return web.json_response({"ok": False, "error": "empty text"}, status=400)
+            err = _history_path_error(path)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
             with _HIST_LOCK:
                 _save_history(path, _upsert(_load_history(path), text, max_entries=max_entries))
             return web.json_response({"ok": True})
@@ -410,6 +430,9 @@ def _register_select_routes() -> None:
             body = await request.json()
             path = body.get("history_path", _DEFAULT_HISTORY_PATH)
             key  = body.get("key", "")
+            err = _history_path_error(path)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
             with _HIST_LOCK:
                 items = [x for x in _load_history(path) if x.get("key") != key]
                 _save_history(path, items)
@@ -422,6 +445,9 @@ def _register_select_routes() -> None:
         try:
             body = await request.json()
             path = body.get("history_path", _DEFAULT_HISTORY_PATH)
+            err = _history_path_error(path)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
             with _HIST_LOCK:
                 _save_history(path, [])
             return web.json_response({"ok": True})

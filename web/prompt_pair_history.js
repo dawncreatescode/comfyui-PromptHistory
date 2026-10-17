@@ -9,7 +9,8 @@
 import { app } from "../../scripts/app.js";
 
 const NODE_TYPE = "SelectPromptPairHistory";
-const DEFAULT_PATH = "custom_nodes/comfyui-PromptHistory/history/prompt_pair_history.json";
+// Replaced in beforeRegisterNodeDef with the backend's default (see there).
+let DEFAULT_PATH = "custom_nodes/comfyui-PromptHistory/history/prompt_pair_history.json";
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -27,6 +28,84 @@ function getSavePath(node) {
     const w = getWidget(node, "save_to_path");
     const val = typeof w?.value === "string" ? w.value : "";
     return val.trim() || DEFAULT_PATH;
+}
+
+// ─── Widget value contract ─────────────────────────────────────────────────
+//
+// Saved workflows carry widget values positionally in `widgets_values`.
+// The contract for this node is: INPUT_TYPES order, buttons never included.
+// Newer ComfyUI frontends (>= 1.2x, July 2026) already drop `serialize:false`
+// widgets from the positional array and add a name-keyed
+// `widgets_values_named`; older ones write one slot per widget. Rather than
+// guess which layout LiteGraph produced, serialize() below writes both forms
+// itself from the widgets by name, and onConfigure() restores by name.
+
+// Widget names in Python INPUT_TYPES order (must match the backend).
+const SERIALIZED_WIDGET_ORDER = [
+    "mode", "positive", "negative", "auto_save",
+    "history_paths", "save_to_path", "active_paths", "max_entries",
+];
+const MODES = ["edit", "random", "sequential"];
+const MAX_ENTRIES_DEFAULT = 500_000;
+const MAX_ENTRIES_MIN     = 1;
+const MAX_ENTRIES_MAX     = 10_000_000;
+
+function widgetDefault(name) {
+    switch (name) {
+        case "mode":          return "edit";
+        case "auto_save":     return true;
+        case "history_paths": return DEFAULT_PATH;
+        case "save_to_path":  return DEFAULT_PATH;
+        case "max_entries":   return MAX_ENTRIES_DEFAULT;
+        default:              return "";
+    }
+}
+
+// Coerce a restored value to the type the backend validates against. Missing or
+// corrupt values (e.g. a workflow saved while values were shifted by one slot)
+// fall back to the widget default instead of being passed through, so an INT
+// widget never ends up holding "" or a path string.
+function coerceWidgetValue(name, val) {
+    switch (name) {
+        case "mode":
+            return MODES.includes(val) ? val : widgetDefault(name);
+        case "auto_save":
+            if (typeof val === "boolean") return val;
+            if (val === "true" || val === "false") return val === "true";
+            return widgetDefault(name);
+        case "max_entries": {
+            if (val == null || val === "" || typeof val === "boolean") return MAX_ENTRIES_DEFAULT;
+            const n = Math.trunc(Number(val));
+            if (!Number.isFinite(n)) return MAX_ENTRIES_DEFAULT;
+            return Math.min(MAX_ENTRIES_MAX, Math.max(MAX_ENTRIES_MIN, n));
+        }
+        default:
+            // positive, negative, history_paths, save_to_path, active_paths
+            return typeof val === "string" ? val : widgetDefault(name);
+    }
+}
+
+function getMaxEntries(node) {
+    return coerceWidgetValue("max_entries", getWidget(node, "max_entries")?.value);
+}
+
+// Read saved widget values from serialized node info. Prefers the name-keyed
+// form (order-independent), then fills gaps from the positional array.
+function readSerializedWidgetValues(info) {
+    const out = {};
+    const named = info?.widgets_values_named;
+    if (named && typeof named === "object" && !Array.isArray(named)) {
+        for (const name of SERIALIZED_WIDGET_ORDER) {
+            if (named[name] !== undefined) out[name] = named[name];
+        }
+    }
+    const positional = info?.widgets_values;
+    if (Array.isArray(positional)) {
+        SERIALIZED_WIDGET_ORDER.forEach((name, i) => {
+            if (out[name] === undefined && positional[i] !== undefined) out[name] = positional[i];
+        });
+    }
+    return out;
 }
 
 function getActivePaths(node) {
@@ -158,11 +237,11 @@ async function apiList(paths, query = "", opts = {}) {
     return data;
 }
 
-async function apiSave(path, positive, negative) {
+async function apiSave(path, positive, negative, maxEntries = MAX_ENTRIES_DEFAULT) {
     const res = await fetch("/prompt_pair_history/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ history_path: path, positive, negative, max_entries: 500_000 }),
+        body: JSON.stringify({ history_path: path, positive, negative, max_entries: maxEntries }),
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
@@ -511,7 +590,7 @@ function openManagePanel(node) {
     const addRow     = el("div", "pph-mgr-add-row");
     const addInput   = el("input", "pph-search");
     addInput.type        = "text";
-    addInput.placeholder = "custom_nodes/comfyui-PromptHistory/history/my_pairs.json";
+    addInput.placeholder = DEFAULT_PATH.replace(/[^/]*$/, "my_pairs.json");
     addInput.style.cssText = "flex: 1; font-size: 12px; padding: 5px 8px;";
     const addBtn = btn("pph-btn", "Add", () => {
         const p = addInput.value.trim();
@@ -900,7 +979,7 @@ function openPanel(node) {
     async function selectItem(item) {
         if (!item) return;
         try {
-            await apiSave(savePath, item.positive, item.negative);
+            await apiSave(savePath, item.positive, item.negative, getMaxEntries(node));
         } catch (err) {
             console.error("[SelectPromptPairHistory] immediate save failed:", err);
         }
@@ -1042,6 +1121,11 @@ function attachToNode(node) {
 
     for (const w of [pathsWidget, saveToWidget, activeWidget, maxWidget]) {
         if (!w) continue;
+        // Current frontends (canvas and Vue node renderers) honour the hidden flag.
+        w.hidden = true;
+        w.options = w.options ?? {};
+        w.options.hidden = true;
+        // Older canvas-only frontends: collapse the row and skip drawing.
         w.computeSize = () => [0, -4];
         w.draw        = () => {};
     }
@@ -1110,6 +1194,13 @@ app.registerExtension({
     beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== NODE_TYPE) return;
 
+        // Use the backend's real default path: it is derived from the folder the
+        // node is actually installed in (registry installs may rename/lowercase it).
+        const backendDefault = nodeData.input?.optional?.history_paths?.[1]?.default;
+        if (typeof backendDefault === "string" && backendDefault.trim()) {
+            DEFAULT_PATH = backendDefault.trim();
+        }
+
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const result = onNodeCreated?.apply(this, arguments);
@@ -1120,43 +1211,33 @@ app.registerExtension({
         const origSerialize = nodeType.prototype.serialize;
         nodeType.prototype.serialize = function () {
             const data = origSerialize?.apply(this, arguments) ?? {};
-            if (Array.isArray(data.widgets_values) && this.widgets) {
-                const compact = [];
-                for (let i = 0; i < this.widgets.length; i++) {
-                    if (this.widgets[i]?.serialize !== false) {
-                        compact.push(data.widgets_values[i] ?? null);
-                    }
-                }
-                data.widgets_values = compact;
+            const named = {};
+            for (const name of SERIALIZED_WIDGET_ORDER) {
+                const w = getWidget(this, name);
+                named[name] = w && w.value !== undefined ? w.value : null;
             }
+            // Positional form in INPUT_TYPES order (buttons excluded) for every
+            // frontend; name-keyed form for frontends that restore by name.
+            data.widgets_values       = SERIALIZED_WIDGET_ORDER.map(name => named[name]);
+            data.widgets_values_named = named;
             return data;
         };
-
-        // Must match Python INPUT_TYPES order exactly
-        const SERIALIZED_WIDGET_ORDER = [
-            "mode", "positive", "negative", "auto_save",
-            "history_paths", "save_to_path", "active_paths", "max_entries",
-        ];
 
         const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function (info, ...rest) {
             this.__pph_is_configure = true;
 
-            const snapshot = {};
-            if (Array.isArray(info?.widgets_values)) {
-                SERIALIZED_WIDGET_ORDER.forEach((name, i) => {
-                    if (info.widgets_values[i] !== undefined) snapshot[name] = info.widgets_values[i];
-                });
-            }
-
+            const saved  = readSerializedWidgetValues(info);
             const result = onConfigure?.apply(this, [info, ...rest]);
 
-            for (const [name, val] of Object.entries(snapshot)) {
+            // Re-apply by name after LiteGraph's own restore so the repositioned
+            // panel button can never offset values, then normalize each value to
+            // the type the backend expects.
+            for (const name of SERIALIZED_WIDGET_ORDER) {
                 const w = getWidget(this, name);
-                if (w) w.value = val;
-            }
-            for (const w of this.widgets ?? []) {
-                if (w?.value == null && w?.type !== "button") w.value = "";
+                if (!w) continue;
+                const raw = saved[name] !== undefined ? saved[name] : w.value;
+                w.value = coerceWidgetValue(name, raw);
             }
             this.__pph_syncTextState?.();
             return result;
