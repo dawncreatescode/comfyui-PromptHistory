@@ -11,7 +11,8 @@ Modes:
 HTTP endpoints:
   POST /prompt_pair_history/list    — search & merge pairs across files
   POST /prompt_pair_history/save    — upsert a pair into a file
-  POST /prompt_pair_history/delete  — remove a pair by key
+  POST /prompt_pair_history/delete  — remove one pair (key) or several (keys)
+  POST /prompt_pair_history/restore — undo a delete
   POST /prompt_pair_history/clear   — wipe all pairs from a file
 """
 
@@ -21,7 +22,6 @@ import hashlib
 import json
 import os
 import random
-import re
 import threading
 import time
 from typing import Any, Dict, List
@@ -32,6 +32,11 @@ try:
 except ImportError:
     PromptServer = None
     web = None
+
+try:
+    from . import _history_common as _common
+except ImportError:  # imported as a plain module (tests)
+    import _history_common as _common
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -118,33 +123,6 @@ def _build_preview(text: str, max_chars: int = 100) -> str:
     return flat
 
 
-def _build_matcher(
-    query: str,
-    *,
-    case_sensitive: bool = False,
-    whole_word: bool = False,
-    use_regex: bool = False,
-):
-    """Return a callable(text) -> bool for the query. Mirrors the single-prompt
-    node's _search_items matching rules (substring / whole word / regex)."""
-    try:
-        if use_regex:
-            flags = 0 if case_sensitive else re.IGNORECASE
-            pat = re.compile(query, flags)
-            return lambda text: bool(pat.search(text))
-        if whole_word:
-            flags = 0 if case_sensitive else re.IGNORECASE
-            pat = re.compile(r"\b" + re.escape(query) + r"\b", flags)
-            return lambda text: bool(pat.search(text))
-        if case_sensitive:
-            return lambda text: query in text
-        q_lower = query.lower()
-        return lambda text: q_lower in text.lower()
-    except re.error:
-        q_fb = query if case_sensitive else query.lower()
-        return lambda text: q_fb in (text if case_sensitive else text.lower())
-
-
 def _upsert_pair(
     items: List[Dict[str, Any]],
     positive: str,
@@ -179,6 +157,114 @@ def _upsert_pair(
     if max_entries > 0:
         items = items[:max_entries]
     return items
+
+
+def _clean_entry(entry: Any) -> Dict[str, Any] | None:
+    """Validate an entry sent back by the browser (undo of a delete)."""
+    if not isinstance(entry, dict):
+        return None
+    positive = entry.get("positive", "")
+    negative = entry.get("negative", "")
+    meta = _common.clean_meta(entry)
+    if meta is None or not isinstance(positive, str) or not isinstance(negative, str):
+        return None
+    if not positive.strip() and not negative.strip():
+        return None
+    return {
+        "key": meta["key"],
+        "positive": positive,
+        "negative": negative,
+        "ts": meta["ts"],
+        "hits": meta["hits"],
+    }
+
+
+def _list_response(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Search and merge the requested pair files (body of the list endpoint)."""
+    history_paths = body.get("history_paths", [])
+    if not isinstance(history_paths, list):
+        history_paths = []
+    search_in = body.get("search_in", "positive")
+    if search_in not in ("positive", "negative", "both"):
+        search_in = "positive"
+    sort_by = body.get("sort_by", "recent")
+    offset, size = _common.page_bounds(body)
+    matchers = _common.build_term_matchers(
+        body.get("query", ""),
+        case_sensitive=bool(body.get("case_sensitive", False)),
+        whole_word=bool(body.get("whole_word", False)),
+        use_regex=bool(body.get("use_regex", False)),
+    )
+
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    with _PAIR_LOCK:
+        for path in history_paths:
+            if not isinstance(path, str):
+                continue
+            for item in _load_pair_history(path):
+                k = item.get("key")
+                if k and k not in seen:
+                    seen.add(k)
+                    merged.append({**item, "source": path})
+
+    total = len(merged)
+
+    if sort_by == "alpha":
+        merged.sort(key=lambda x: str(x.get("positive", "")).lower())
+    elif sort_by == "hits":
+        merged.sort(key=lambda x: x.get("hits", 0) if isinstance(x.get("hits"), int) else 0, reverse=True)
+    else:
+        merged.sort(key=lambda x: str(x.get("ts", "")), reverse=True)
+
+    if matchers:
+        def _fields(it: Dict[str, Any]) -> List[str]:
+            fields = []
+            if search_in != "negative":
+                fields.append(str(it.get("positive", "")))
+            if search_in != "positive":
+                fields.append(str(it.get("negative", "")))
+            return fields
+
+        merged = [it for it in merged if _common.entry_matches(_fields(it), matchers)]
+
+    return {
+        "ok": True,
+        "total": total,
+        "matched": len(merged),
+        "offset": offset,
+        "items": [
+            {
+                "key":              it["key"],
+                "positive":         it.get("positive", ""),
+                "negative":         it.get("negative", ""),
+                "positive_preview": _build_preview(it.get("positive", "")),
+                "negative_preview": _build_preview(it.get("negative", "")),
+                "ts":               it.get("ts", ""),
+                "hits":             it.get("hits", 1),
+                "source":           it.get("source", ""),
+            }
+            for it in merged[offset:offset + size]
+        ],
+    }
+
+
+def _delete_entries(path: str, keys: List[str]) -> List[Dict[str, Any]]:
+    """Remove pairs by key; returns what was removed (with positions) for undo."""
+    with _PAIR_LOCK:
+        kept, removed = _common.remove_keys(_load_pair_history(path), keys)
+        if removed:
+            _save_pair_history(path, kept)
+    return removed
+
+
+def _restore_entries(path: str, removed: Any) -> int:
+    """Put back pairs returned by :func:`_delete_entries`."""
+    with _PAIR_LOCK:
+        items, restored = _common.restore_removed(_load_pair_history(path), removed, _clean_entry)
+        if restored:
+            _save_pair_history(path, items)
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -279,10 +365,13 @@ class SelectPromptPairHistoryNode:
         active_list = _parse_active(active_paths)
         effective_paths = [p for p in all_paths if p in active_list] if active_list else all_paths
 
+        auto_mode = mode in ("random", "sequential")
+
         with _PAIR_LOCK:
+            # Edit mode never picks from history, so it skips reading the files.
             merged: List[Dict[str, Any]] = []
             seen: set = set()
-            for path in effective_paths:
+            for path in (effective_paths if auto_mode else ()):
                 for item in _load_pair_history(path):
                     k = item.get("key")
                     if k and k not in seen:
@@ -291,13 +380,13 @@ class SelectPromptPairHistoryNode:
 
             if mode == "random" and merged:
                 chosen = random.choice(merged)
-                used_positive = chosen["positive"]
+                used_positive = chosen.get("positive", "")
                 used_negative = chosen.get("negative", "")
             elif mode == "sequential" and merged:
                 seq_key = "|".join(sorted(effective_paths))
                 idx = SelectPromptPairHistoryNode._seq_index.get(seq_key, 0) % len(merged)
                 chosen = merged[idx]
-                used_positive = chosen["positive"]
+                used_positive = chosen.get("positive", "")
                 used_negative = chosen.get("negative", "")
                 SelectPromptPairHistoryNode._seq_index[seq_key] = idx + 1
             else:
@@ -319,7 +408,11 @@ class SelectPromptPairHistoryNode:
             except Exception as exc:
                 print(f"[SelectPromptPairHistory] CLIP encode failed: {exc}")
 
-        return (used_positive, used_negative, pos_cond, neg_cond)
+        result = (used_positive, used_negative, pos_cond, neg_cond)
+        if auto_mode:
+            # Tell the frontend which pair this run picked (shown on the node).
+            return {"ui": {"prompt_history_used": [used_positive, used_negative]}, "result": result}
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -335,73 +428,7 @@ def _register_pair_routes() -> None:
     @routes.post("/prompt_pair_history/list")
     async def _pph_list(request):
         try:
-            body = await request.json()
-            history_paths: List[str] = body.get("history_paths", [])
-            query    = body.get("query", "").strip()
-            case_sensitive = bool(body.get("case_sensitive", False))
-            whole_word     = bool(body.get("whole_word", False))
-            use_regex      = bool(body.get("use_regex", False))
-            search_in      = body.get("search_in", "positive")
-            if search_in not in ("positive", "negative", "both"):
-                search_in = "positive"
-            sort_by  = body.get("sort_by", "recent")
-            max_results = int(body.get("max_results", 300))
-
-            merged: List[Dict[str, Any]] = []
-            seen: set = set()
-            with _PAIR_LOCK:
-                for path in history_paths:
-                    for item in _load_pair_history(path):
-                        k = item.get("key")
-                        if k and k not in seen:
-                            seen.add(k)
-                            merged.append({**item, "source": path})
-
-            total = len(merged)
-
-            if sort_by == "alpha":
-                merged.sort(key=lambda x: x.get("positive", "").lower())
-            elif sort_by == "hits":
-                merged.sort(key=lambda x: x.get("hits", 0), reverse=True)
-            else:
-                merged.sort(key=lambda x: x.get("ts", ""), reverse=True)
-
-            if query:
-                matcher = _build_matcher(
-                    query,
-                    case_sensitive=case_sensitive,
-                    whole_word=whole_word,
-                    use_regex=use_regex,
-                )
-
-                def _entry_matches(it: Dict[str, Any]) -> bool:
-                    if search_in in ("positive", "both") and matcher(it.get("positive", "")):
-                        return True
-                    if search_in in ("negative", "both") and matcher(it.get("negative", "")):
-                        return True
-                    return False
-
-                merged = [it for it in merged if _entry_matches(it)]
-
-            results = merged[:max_results]
-
-            return web.json_response({
-                "ok": True,
-                "total": total,
-                "items": [
-                    {
-                        "key":              it["key"],
-                        "positive":         it["positive"],
-                        "negative":         it.get("negative", ""),
-                        "positive_preview": _build_preview(it["positive"]),
-                        "negative_preview": _build_preview(it.get("negative", "")),
-                        "ts":               it.get("ts", ""),
-                        "hits":             it.get("hits", 1),
-                        "source":           it.get("source", ""),
-                    }
-                    for it in results
-                ],
-            })
+            return web.json_response(_list_response(await request.json()))
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
@@ -429,14 +456,24 @@ def _register_pair_routes() -> None:
         try:
             body = await request.json()
             path = body.get("history_path", _DEFAULT_PAIR_HISTORY_PATH)
-            key  = body.get("key", "")
             err = _history_path_error(path)
             if err:
                 return web.json_response({"ok": False, "error": err}, status=400)
-            with _PAIR_LOCK:
-                items = [x for x in _load_pair_history(path) if x.get("key") != key]
-                _save_pair_history(path, items)
-            return web.json_response({"ok": True})
+            removed = _delete_entries(path, _common.keys_from_body(body))
+            return web.json_response({"ok": True, "removed": removed})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    @routes.post("/prompt_pair_history/restore")
+    async def _pph_restore(request):
+        try:
+            body = await request.json()
+            path = body.get("history_path", _DEFAULT_PAIR_HISTORY_PATH)
+            err = _history_path_error(path)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
+            restored = _restore_entries(path, body.get("removed"))
+            return web.json_response({"ok": True, "restored": restored})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 

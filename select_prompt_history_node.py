@@ -12,7 +12,8 @@ HTTP endpoints:
   POST /select_prompt_history/list   — search & merge across multiple files
   GET  /select_prompt_history/scan   — discover JSON files in the node folder
   POST /prompt_history/save          — upsert a prompt into a file
-  POST /prompt_history/delete        — remove a prompt by key
+  POST /prompt_history/delete        — remove one prompt (key) or several (keys)
+  POST /prompt_history/restore       — undo a delete
   POST /prompt_history/clear         — wipe all prompts from a file
 
 License: MIT
@@ -24,7 +25,6 @@ import hashlib
 import json
 import os
 import random
-import re
 import threading
 import time
 from typing import Any, Dict, List
@@ -35,6 +35,11 @@ try:
 except ImportError:
     PromptServer = None
     web = None
+
+try:
+    from . import _history_common as _common
+except ImportError:  # imported as a plain module (tests)
+    import _history_common as _common
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -135,45 +140,91 @@ def _upsert(
     return items
 
 
-def _search_items(
-    items: List[Dict[str, Any]],
-    query: str,
-    *,
-    case_sensitive: bool = False,
-    whole_word: bool = False,
-    use_regex: bool = False,
-    max_results: int = 300,
-) -> List[Dict[str, Any]]:
-    """Filter items by query. Caller is responsible for sorting before calling."""
-    query = query.strip() if query else ""
-    if not query:
-        return items[:max_results]
-    try:
-        if use_regex:
-            flags = 0 if case_sensitive else re.IGNORECASE
-            pat = re.compile(query, flags)
-            matcher = pat.search
-        elif whole_word:
-            flags = 0 if case_sensitive else re.IGNORECASE
-            pat = re.compile(r"\b" + re.escape(query) + r"\b", flags)
-            matcher = pat.search
-        else:
-            if case_sensitive:
-                matcher = lambda text: query in text  # noqa: E731
-            else:
-                q_lower = query.lower()
-                matcher = lambda text: q_lower in text.lower()  # noqa: E731
-    except re.error:
-        q_fb = query if case_sensitive else query.lower()
-        matcher = lambda text: q_fb in (text if case_sensitive else text.lower())  # noqa: E731
+def _clean_entry(entry: Any) -> Dict[str, Any] | None:
+    """Validate an entry sent back by the browser (undo of a delete)."""
+    if not isinstance(entry, dict):
+        return None
+    text = entry.get("text")
+    meta = _common.clean_meta(entry)
+    if meta is None or not isinstance(text, str) or not text.strip():
+        return None
+    return {"key": meta["key"], "text": text, "ts": meta["ts"], "hits": meta["hits"]}
 
-    results: List[Dict[str, Any]] = []
-    for item in items:
-        if matcher(item.get("text", "")):
-            results.append(item)
-            if len(results) >= max_results:
-                break
-    return results
+
+def _list_response(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Search and merge the requested history files (body of the list endpoint)."""
+    history_paths = body.get("history_paths", [])
+    if not isinstance(history_paths, list):
+        history_paths = []
+    sort_by = body.get("sort_by", "recent")
+    offset, size = _common.page_bounds(body)
+    matchers = _common.build_term_matchers(
+        body.get("query", ""),
+        case_sensitive=bool(body.get("case_sensitive", False)),
+        whole_word=bool(body.get("whole_word", False)),
+        use_regex=bool(body.get("use_regex", False)),
+    )
+
+    # Load and merge from all requested paths, tagging each item with its source
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    with _HIST_LOCK:
+        for path in history_paths:
+            if not isinstance(path, str):
+                continue
+            for item in _load_history(path):
+                k = item.get("key")
+                if k and k not in seen:
+                    seen.add(k)
+                    merged.append({**item, "source": path})
+
+    total = len(merged)
+
+    if sort_by == "alpha":
+        merged.sort(key=lambda x: str(x.get("text", "")).lower())
+    elif sort_by == "hits":
+        merged.sort(key=lambda x: x.get("hits", 0) if isinstance(x.get("hits"), int) else 0, reverse=True)
+    else:  # recent: sort by timestamp across all sources
+        merged.sort(key=lambda x: str(x.get("ts", "")), reverse=True)
+
+    if matchers:
+        merged = [it for it in merged if _common.entry_matches((str(it.get("text", "")),), matchers)]
+
+    return {
+        "ok": True,
+        "total": total,
+        "matched": len(merged),
+        "offset": offset,
+        "items": [
+            {
+                "key":     it["key"],
+                "text":    it["text"],
+                "preview": _build_preview(it["text"]),
+                "ts":      it.get("ts", ""),
+                "hits":    it.get("hits", 1),
+                "source":  it.get("source", ""),
+            }
+            for it in merged[offset:offset + size]
+        ],
+    }
+
+
+def _delete_entries(path: str, keys: List[str]) -> List[Dict[str, Any]]:
+    """Remove entries by key; returns what was removed (with positions) for undo."""
+    with _HIST_LOCK:
+        kept, removed = _common.remove_keys(_load_history(path), keys)
+        if removed:
+            _save_history(path, kept)
+    return removed
+
+
+def _restore_entries(path: str, removed: Any) -> int:
+    """Put back entries returned by :func:`_delete_entries`."""
+    with _HIST_LOCK:
+        items, restored = _common.restore_removed(_load_history(path), removed, _clean_entry)
+        if restored:
+            _save_history(path, items)
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +333,14 @@ class SelectPromptHistoryNode:
         # Empty active_list means all paths are active
         effective_paths = [p for p in all_paths if p in active_list] if active_list else all_paths
 
+        auto_mode = mode in ("random", "sequential")
+
         with _HIST_LOCK:
-            # Merge items from all effective paths, dedup by key (first occurrence wins)
+            # Merge items from all effective paths, dedup by key (first occurrence wins).
+            # Edit mode never picks from history, so it skips reading the files.
             merged: List[Dict[str, Any]] = []
             seen: set = set()
-            for path in effective_paths:
+            for path in (effective_paths if auto_mode else ()):
                 for item in _load_history(path):
                     k = item.get("key")
                     if k and k not in seen:
@@ -316,6 +370,9 @@ class SelectPromptHistoryNode:
             except Exception as exc:
                 print(f"[SelectPromptHistory] CLIP encode failed: {exc}")
 
+        if auto_mode:
+            # Tell the frontend which prompt this run picked (shown on the node).
+            return {"ui": {"prompt_history_used": [used_text]}, "result": (used_text, conditioning)}
         return (used_text, conditioning)
 
 
@@ -332,59 +389,7 @@ def _register_select_routes() -> None:
     @routes.post("/select_prompt_history/list")
     async def _sph_list(request):
         try:
-            body = await request.json()
-            history_paths: List[str] = body.get("history_paths", [])
-            query        = body.get("query", "")
-            case_sensitive = bool(body.get("case_sensitive", False))
-            whole_word   = bool(body.get("whole_word", False))
-            use_regex    = bool(body.get("use_regex", False))
-            sort_by      = body.get("sort_by", "recent")
-            max_results  = int(body.get("max_results", 300))
-
-            # Load and merge from all requested paths, tagging each item with its source
-            merged: List[Dict[str, Any]] = []
-            seen: set = set()
-            with _HIST_LOCK:
-                for path in history_paths:
-                    for item in _load_history(path):
-                        k = item.get("key")
-                        if k and k not in seen:
-                            seen.add(k)
-                            merged.append({**item, "source": path})
-
-            total = len(merged)
-
-            # Sort the merged list before filtering
-            if sort_by == "alpha":
-                merged.sort(key=lambda x: x.get("text", "").lower())
-            elif sort_by == "hits":
-                merged.sort(key=lambda x: x.get("hits", 0), reverse=True)
-            else:  # recent: sort by timestamp across all sources
-                merged.sort(key=lambda x: x.get("ts", ""), reverse=True)
-
-            results = _search_items(
-                merged, query,
-                case_sensitive=case_sensitive,
-                whole_word=whole_word,
-                use_regex=use_regex,
-                max_results=max_results,
-            )
-
-            return web.json_response({
-                "ok": True,
-                "total": total,
-                "items": [
-                    {
-                        "key":     it["key"],
-                        "text":    it["text"],
-                        "preview": _build_preview(it["text"]),
-                        "ts":      it.get("ts", ""),
-                        "hits":    it.get("hits", 1),
-                        "source":  it.get("source", ""),
-                    }
-                    for it in results
-                ],
-            })
+            return web.json_response(_list_response(await request.json()))
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
@@ -429,14 +434,24 @@ def _register_select_routes() -> None:
         try:
             body = await request.json()
             path = body.get("history_path", _DEFAULT_HISTORY_PATH)
-            key  = body.get("key", "")
             err = _history_path_error(path)
             if err:
                 return web.json_response({"ok": False, "error": err}, status=400)
-            with _HIST_LOCK:
-                items = [x for x in _load_history(path) if x.get("key") != key]
-                _save_history(path, items)
-            return web.json_response({"ok": True})
+            removed = _delete_entries(path, _common.keys_from_body(body))
+            return web.json_response({"ok": True, "removed": removed})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    @routes.post("/prompt_history/restore")
+    async def _ph_restore(request):
+        try:
+            body = await request.json()
+            path = body.get("history_path", _DEFAULT_HISTORY_PATH)
+            err = _history_path_error(path)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
+            restored = _restore_entries(path, body.get("removed"))
+            return web.json_response({"ok": True, "restored": restored})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
