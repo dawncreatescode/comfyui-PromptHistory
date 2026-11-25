@@ -13,7 +13,9 @@
  *   fields: [{name, label, tone?, emptyText?}]
  *                                      text widgets of the node = text fields of an entry
  *   widgetOrder                        widget names in Python INPUT_TYPES order
- *   endpoints: {list, save, delete, restore, clear}
+ *   endpoints: {list, save, delete, restore, clear, info?}
+ *                                      info: per-file {own, pairs} counts, for a node
+ *                                      that can read the other node's files
  *   labels: {panelTitle, panelButton, manageTitle, noun, nouns, addPlaceholder}
  *   scopes?: {options: [[value, label]], default, fieldsFor(value), placeholder(value)}
  *                                      optional "search in" selector
@@ -115,6 +117,76 @@ async function postJson(url, body) {
     return data;
 }
 
+/**
+ * Per file `{own, pairs}`: how many entries belong to this node and how many
+ * are prompt pairs it only reads. Null when the adapter has no such endpoint
+ * or the request fails (e.g. the backend is older than this file).
+ */
+async function fetchFileInfo(adapter, paths) {
+    if (!adapter.endpoints.info || !paths.length) return null;
+    try {
+        const data = await postJson(adapter.endpoints.info, { paths });
+        return data.files && typeof data.files === "object" ? data.files : null;
+    } catch (err) {
+        console.warn(`[${adapter.tag}] file info:`, err);
+        return null;
+    }
+}
+
+/** Which half of a pair this node uses from pair files; null when it has no such setting. */
+function getPairSide(node) {
+    const w = getWidget(node, "pair_side");
+    if (!w) return null;
+    return w.value === "negative" ? "negative" : "positive";
+}
+
+// ─── Clipboard ─────────────────────────────────────────────────────────────
+//
+// navigator.clipboard only exists on https and localhost pages. ComfyUI is
+// often opened over plain http from another machine, and there the old
+// execCommand route is the only one that works. It has to run inside the
+// click itself, so nothing is awaited before it on such pages.
+
+async function copyText(text) {
+    if (navigator.clipboard?.writeText) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch (_) { /* blocked: try the old way */ }
+    }
+    return legacyCopy(text);
+}
+
+function legacyCopy(text) {
+    const previous = document.activeElement;
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.readOnly = true;
+    ta.style.cssText = "position: fixed; top: 0; left: -9999px; opacity: 0;";
+    document.body.appendChild(ta);
+    let ok = false;
+    try {
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        ok = document.execCommand("copy") === true;
+    } catch (_) {
+        ok = false;
+    }
+    ta.remove();
+    try { previous?.focus?.({ preventScroll: true }); } catch (_) { /* ignore */ }
+    return ok;
+}
+
+function selectContents(element) {
+    try {
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+    } catch (_) { /* ignore */ }
+}
+
 // ─── Widget value contract ─────────────────────────────────────────────────
 //
 // Saved workflows carry widget values positionally in `widgets_values`.
@@ -142,6 +214,7 @@ function widgetDefault(adapter, name) {
         case "history_paths": return adapter.defaultPath;
         case "save_to_path":  return adapter.defaultPath;
         case "max_entries":   return MAX_ENTRIES_DEFAULT;
+        case "pair_side":     return "positive";
         default:              return "";
     }
 }
@@ -164,6 +237,8 @@ function coerceWidgetValue(adapter, name, val) {
             if (!Number.isFinite(n)) return MAX_ENTRIES_DEFAULT;
             return Math.min(MAX_ENTRIES_MAX, Math.max(MAX_ENTRIES_MIN, n));
         }
+        case "pair_side":
+            return val === "positive" || val === "negative" ? val : widgetDefault(adapter, name);
         default:
             // text fields, history_paths, save_to_path, active_paths
             return typeof val === "string" ? val : widgetDefault(adapter, name);
@@ -223,6 +298,7 @@ function batchStore(adapter) {
 function slimItem(adapter, item) {
     const out = { key: item.key };
     if (item.source) out.source = item.source;
+    if (item.from_pair) out.from_pair = true;
     for (const f of adapter.fields) out[f.name] = typeof item[f.name] === "string" ? item[f.name] : "";
     return out;
 }
@@ -318,6 +394,8 @@ function trapKeys(handler) {
 
 function openManagePanel(node, adapter) {
     injectCSS();
+    const nouns = adapter.labels.nouns;
+    let closed = false;
 
     function readPaths() {
         return getHistoryPaths(node);
@@ -329,7 +407,8 @@ function openManagePanel(node, adapter) {
         // If the save_to_path is no longer in the list, reset it to the first entry
         const saveW = getWidget(node, "save_to_path");
         if (saveW && deduped.length && !deduped.includes(saveW.value)) {
-            setWidgetValue(node, "save_to_path", deduped[0]);
+            // Prefer a file this node may write to over a (read-only) pair file.
+            setWidgetValue(node, "save_to_path", deduped.find(p => !isPairFile(p)) ?? deduped[0]);
         }
         return deduped;
     }
@@ -337,7 +416,7 @@ function openManagePanel(node, adapter) {
     const overlay = el("div", "ph-overlay");
     const card    = el("div", "ph-card");
     // This modal sizes to its content — switch off the main panel's fixed flex height
-    card.style.cssText = "width: min(520px, calc(100vw - 24px)); display: block; height: auto;";
+    card.style.cssText = "width: min(540px, calc(100vw - 24px)); display: block; height: auto;";
 
     const header   = el("div", "ph-header");
     const titleRow = el("div", "ph-title-row");
@@ -347,16 +426,72 @@ function openManagePanel(node, adapter) {
     header.appendChild(titleRow);
 
     const body = document.createElement("div");
-    body.style.cssText = "overflow-y: auto; max-height: min(55vh, 340px);";
+    body.style.cssText = "overflow-y: auto; max-height: min(65vh, 460px);";
 
     // Section: discovered files (populated by scan)
     const scanSection = el("div", "ph-mgr-section");
     scanSection.style.display = "none";
     body.appendChild(scanSection);
 
-    // Section: current files list
+    // Section: files used by this node
     const listSection = el("div", "ph-mgr-section");
     body.appendChild(listSection);
+
+    // Section: which half of a pair to use (only when a pair file is in the list)
+    const sideSection = el("div", "ph-mgr-section ph-mgr-side");
+    sideSection.hidden = true;
+    const sideSel = el("select", "ph-mgr-select");
+    for (const [value, label] of [["positive", "Positive"], ["negative", "Negative"]]) {
+        const o = document.createElement("option");
+        o.value = value; o.textContent = label;
+        sideSel.appendChild(o);
+    }
+    sideSel.value = getPairSide(node) ?? "positive";
+    sideSel.title = "Pairs hold a positive and a negative prompt. This node uses one of the two.";
+    sideSel.onchange = () => setWidgetValue(node, "pair_side", sideSel.value);
+    sideSection.append(
+        el("span", "ph-mgr-label", "From pair files use:"),
+        sideSel,
+        el("span", "ph-mgr-label", "prompt"),
+    );
+    body.appendChild(sideSection);
+
+    // Undo for "Remove from node". Removing only changes widget values, so
+    // putting the previous values back is a complete undo.
+    let removedState = null;   // {paths, saveTo}
+    const undoBar  = el("div", "ph-undo");
+    undoBar.hidden = true;
+    const undoText = el("span", "ph-undo-text");
+    undoBar.append(undoText, btn("ph-btn small", "Undo", undoRemove));
+    body.appendChild(undoBar);
+
+    function forgetUndo() {
+        removedState = null;
+        undoBar.hidden = true;
+    }
+
+    function removeFile(path) {
+        removedState = { paths: readPaths(), saveTo: getWidget(node, "save_to_path")?.value };
+        writePaths(removedState.paths.filter(p => p !== path));
+        undoText.textContent = `Removed ${pathBasename(path)} from this node. The file itself was not changed.`;
+        undoBar.hidden = false;
+        refresh();
+    }
+
+    function undoRemove() {
+        if (!removedState) return;
+        setWidgetValue(node, "history_paths", removedState.paths.join("\n"));
+        if (typeof removedState.saveTo === "string") setWidgetValue(node, "save_to_path", removedState.saveTo);
+        forgetUndo();
+        refresh();
+    }
+
+    function addFile(path) {
+        // An undo after this would drop the file that was just added.
+        forgetUndo();
+        writePaths([...readPaths(), path]);
+        refresh();
+    }
 
     // Section: add by path
     const addSection = el("div", "ph-mgr-section");
@@ -368,14 +503,34 @@ function openManagePanel(node, adapter) {
     const addBtn = btn("ph-btn", "Add", () => {
         const p = addInput.value.trim();
         if (!p) return;
-        writePaths([...readPaths(), p]);
         addInput.value = "";
-        renderList();
-        loadScan();
+        addFile(p);
     });
     addRow.append(addInput, addBtn);
     addSection.append(el("div", "ph-mgr-label", "Add by path:"), addRow);
     body.appendChild(addSection);
+
+    // Section: delete every entry of a file.
+    // Kept apart from the file rows and closed by default, and deleting takes
+    // two deliberate presses: the first only arms a row, and the confirm
+    // button appears somewhere else than the button that was just pressed.
+    const dangerSection = el("div", "ph-mgr-section");
+    const dangerToggle  = btn("ph-mgr-toggle", "", () => {
+        dangerOpen = !dangerOpen;
+        armedPath = null;
+        renderDanger();
+    });
+    const dangerBody = el("div", "ph-mgr-danger");
+    dangerSection.append(dangerToggle, dangerBody);
+    body.appendChild(dangerSection);
+
+    let dangerOpen = false;
+    let armedPath  = null;        // file waiting for "Yes, delete all"
+    let deleting   = false;
+    let countSeq   = 0;
+    const counts   = new Map();   // path -> number of entries this node may delete, or null when unreadable
+    const pairCounts = new Map(); // path -> prompt pairs in the file (single-prompt node only)
+    function isPairFile(path) { return pairCounts.get(path) > 0; }
 
     const footer = el("div", "ph-footer");
     footer.append(el("span", "ph-spacer"), btn("ph-btn", "Done", close));
@@ -385,53 +540,170 @@ function openManagePanel(node, adapter) {
     document.body.appendChild(overlay);
 
     const releaseKeys = trapKeys(e => {
-        if (e.key === "Escape") { e.preventDefault(); close(); }
-        else if (e.key === "Enter" && e.target === addInput) { e.preventDefault(); addBtn.click(); }
+        if (e.key === "Escape") {
+            e.preventDefault();
+            // Esc backs out of a pending delete first; a second Esc closes.
+            if (armedPath !== null) { armedPath = null; renderDangerRows(); }
+            else close();
+        } else if (e.key === "Enter" && e.target === addInput) {
+            e.preventDefault();
+            addBtn.click();
+        }
     });
     function close() {
+        if (closed) return;
+        closed = true;
         releaseKeys();
         overlay.remove();
     }
 
-    async function clearFile(path) {
-        const what = adapter.labels.nouns;
-        if (!confirm(`Clear ALL ${what} from:\n${pathBasename(path)}\n\nThis cannot be undone.`)) return;
-        try {
-            await postJson(adapter.endpoints.clear, { history_path: path });
-            toast("success", "Prompt History", `Cleared ${pathBasename(path)}`);
-        } catch (err) {
-            console.error(`[${adapter.tag}] clear:`, err);
-            toast("error", "Prompt History", `Could not clear ${pathBasename(path)}: ${err.message ?? err}`);
-        }
+    function refresh() {
+        renderList();
+        loadScan();
+        renderDanger();
+        // The file rows need to know which files are pair files. (The delete
+        // section loads the same numbers itself when it is open.)
+        if (adapter.endpoints.info && !dangerOpen) loadCounts();
     }
 
     function renderList() {
         const paths = readPaths();
         listSection.innerHTML = "";
-        listSection.appendChild(el("div", "ph-mgr-label", paths.length ? "Current files:" : "No files configured yet."));
+        listSection.appendChild(el("div", "ph-mgr-label", paths.length ? "Files used by this node:" : "No files configured yet."));
         paths.forEach(path => {
             const row  = el("div", "ph-mgr-row");
             const name = el("span", "ph-mgr-name", pathBasename(path));
             name.title = path;
             const full = el("span", "ph-mgr-path", path);
-            const clear = btn("ph-btn small danger", "Clear…", () => clearFile(path));
-            clear.title = `Delete every entry in this file`;
-            const del  = btn("ph-mgr-del", "×", () => {
-                writePaths(readPaths().filter(p => p !== path));
-                renderList();
-                loadScan();
-            });
-            del.title = "Remove from this node (the file is kept)";
-            row.append(name, full, clear, del);
+            const remove = btn("ph-btn small", "Remove from node", () => removeFile(path));
+            remove.title = "Stop using this file in this node. The file and everything in it stay on disk.\n"
+                + "To skip a file only for a while, use the source chips in the panel instead.";
+            row.append(name, full);
+            if (isPairFile(path)) {
+                const tag = el("span", "ph-mgr-tag", "pair file · read-only");
+                tag.title = "Written by the pair node. This node uses one half of each pair and never writes to the file.";
+                row.appendChild(tag);
+            }
+            row.appendChild(remove);
             listSection.appendChild(row);
         });
+        if (isPairFile(getSavePath(node, adapter))) {
+            listSection.appendChild(el("div", "ph-mgr-note",
+                "New prompts are not being saved: “Save to” is a pair file. "
+                + "Add a prompt file here, then choose it under “Save to” in the panel."));
+        }
+        sideSection.hidden = !(getPairSide(node) && paths.some(isPairFile));
+    }
+
+    // ── Delete all entries of a file ──
+    function renderDanger() {
+        dangerToggle.textContent = `${dangerOpen ? "▾" : "▸"} Delete all ${nouns} in a file…`;
+        dangerBody.hidden = !dangerOpen;
+        if (!dangerOpen) return;
+        if (armedPath !== null && !readPaths().includes(armedPath)) armedPath = null;
+        renderDangerRows();
+        loadCounts();
+    }
+
+    async function loadCounts() {
+        const seq = ++countSeq;
+        const paths = readPaths();
+        const pairsBefore = paths.filter(isPairFile).join("\n");
+        const info = await fetchFileInfo(adapter, paths);
+        if (info) {
+            for (const path of paths) {
+                const own = info[path]?.own;
+                counts.set(path, typeof own === "number" ? own : null);
+                pairCounts.set(path, info[path]?.pairs > 0 ? info[path].pairs : 0);
+            }
+        } else {
+            await Promise.all(paths.map(async path => {
+                try {
+                    const data = await postJson(adapter.endpoints.list, { history_paths: [path], query: "", max_results: 1 });
+                    counts.set(path, typeof data.total === "number" ? data.total : 0);
+                } catch {
+                    counts.set(path, null);
+                }
+            }));
+        }
+        if (seq !== countSeq || closed) return;
+        // Redraw the file rows only when the pair-file tags actually change.
+        if (readPaths().filter(isPairFile).join("\n") !== pairsBefore) renderList();
+        // While a row is armed its text must not change under the pointer.
+        if (dangerOpen && armedPath === null) renderDangerRows();
+    }
+
+    function renderDangerRows() {
+        dangerBody.textContent = "";
+        const paths = readPaths();
+        if (!paths.length) {
+            dangerBody.appendChild(el("div", "ph-mgr-label", "No files configured."));
+            return;
+        }
+        let focusAfter = null;
+        for (const path of paths) {
+            const fileName = pathBasename(path);
+            const n = counts.get(path);
+            const row = el("div", "ph-mgr-row");
+
+            if (path === armedPath) {
+                row.classList.add("ph-mgr-armed");
+                const what = `${n.toLocaleString()} ${plural(adapter, n)}`;
+                const keeps = isPairFile(path) ? " Pairs in this file are kept." : "";
+                row.appendChild(el("span", "ph-mgr-ask", `Delete all ${what} in ${fileName}? This cannot be undone.${keeps}`));
+                const yes = btn("ph-btn small danger", "Yes, delete all", () => deleteAll(path));
+                const cancel = btn("ph-btn small", "Cancel", () => { armedPath = null; renderDangerRows(); });
+                // Cancel sits last, where "Delete all…" was, and takes focus: a
+                // double-click or a stray Enter cancels instead of confirming.
+                row.append(yes, cancel);
+                focusAfter = cancel;
+            } else {
+                const name = el("span", "ph-mgr-name", fileName);
+                name.title = path;
+                const count = el("span", "ph-mgr-count",
+                    !counts.has(path) ? "counting…"
+                        : n === null ? "could not be read"
+                            : n === 0 ? (isPairFile(path) ? "pairs only — delete them in the pair node" : "empty")
+                                : `${n.toLocaleString()} ${plural(adapter, n)}`);
+                row.append(name, count);
+                if (typeof n === "number" && n > 0) {
+                    const arm = btn("ph-btn small danger", `Delete all ${n.toLocaleString()}…`, () => {
+                        if (deleting) return;
+                        armedPath = path;
+                        renderDangerRows();
+                    });
+                    arm.title = `Asks once more before deleting every entry in ${fileName}`;
+                    row.appendChild(arm);
+                }
+            }
+            dangerBody.appendChild(row);
+        }
+        focusAfter?.focus();
+    }
+
+    async function deleteAll(path) {
+        if (deleting || armedPath !== path) return;
+        deleting = true;
+        const n = counts.get(path) ?? 0;
+        const fileName = pathBasename(path);
+        try {
+            await postJson(adapter.endpoints.clear, { history_path: path });
+            counts.set(path, 0);
+            toast("success", "Prompt History", `Deleted all ${n.toLocaleString()} ${plural(adapter, n)} from ${fileName}`);
+        } catch (err) {
+            console.error(`[${adapter.tag}] clear:`, err);
+            toast("error", "Prompt History", `Could not empty ${fileName}: ${err.message ?? err}`);
+        }
+        deleting = false;
+        armedPath = null;
+        if (!closed) renderDangerRows();
     }
 
     async function loadScan() {
         try {
             const res  = await fetch(SCAN_ENDPOINT);
             const data = await res.json();
-            if (!data.ok) return;
+            if (!data.ok || closed) return;
             const current  = readPaths();
             const notAdded = (data.files ?? []).filter(f => !current.includes(f));
             scanSection.style.display = notAdded.length ? "" : "none";
@@ -440,11 +712,7 @@ function openManagePanel(node, adapter) {
             scanSection.appendChild(el("div", "ph-mgr-label", "Found in node folder — click to add:"));
             const chips = el("div", "ph-mgr-chips");
             notAdded.forEach(f => {
-                const chip = btn("ph-chip", "+ " + pathBasename(f), () => {
-                    writePaths([...readPaths(), f]);
-                    renderList();
-                    loadScan();
-                });
+                const chip = btn("ph-chip", "+ " + pathBasename(f), () => addFile(f));
                 chip.title = f;
                 chips.appendChild(chip);
             });
@@ -452,8 +720,7 @@ function openManagePanel(node, adapter) {
         } catch { /* scan errors are non-fatal */ }
     }
 
-    renderList();
-    loadScan();
+    refresh();
     requestAnimationFrame(() => addInput.focus());
 }
 
@@ -480,6 +747,10 @@ function openPanel(node, adapter) {
     const savedActive = getActivePaths(node);
     let activePaths = savedActive.length > 0 ? new Set(savedActive) : null;
     let savePath    = getSavePath(node, adapter);
+    // Single-prompt node only: the half it uses from pair files, and which of
+    // its files are pair files (read-only here; filled in once the backend answers).
+    const pairSide  = getPairSide(node);
+    let pairFiles   = new Set();
 
     const scopeValues = adapter.scopes ? adapter.scopes.options.map(o => o[0]) : [];
     const opts = {
@@ -510,6 +781,7 @@ function openPanel(node, adapter) {
     let closed       = false;
     let paint        = null;   // drag down the gutter: {on, lastIdx}
     let undo         = null;   // {groups, timer}
+    let recentButtons = [];    // buttons inside the open Recent list (disabled while queueing)
 
     // ── DOM ──
     const overlay = el("div", "ph-overlay");
@@ -568,18 +840,44 @@ function openPanel(node, adapter) {
 
     // Save-to
     const savetoRow = el("div", "ph-saveto-row");
-    const savetoSel = el("select", "ph-saveto");
+    const savetoSel  = el("select", "ph-saveto");
+    const savetoOpts = [];
     allPaths.forEach(path => {
         const opt = document.createElement("option");
         opt.value = path; opt.textContent = pathBasename(path); opt.title = path;
         if (path === savePath) opt.selected = true;
+        savetoOpts.push(opt);
         savetoSel.appendChild(opt);
     });
     savetoSel.onchange = () => {
         savePath = savetoSel.value;
         setWidgetValue(node, "save_to_path", savePath);
+        syncSaveTo();
     };
-    savetoRow.append(el("span", "ph-saveto-label", "Save to:"), savetoSel);
+    const savetoWarn = el("span", "ph-saveto-warn");
+    savetoWarn.hidden = true;
+    savetoRow.append(el("span", "ph-saveto-label", "Save to:"), savetoSel, savetoWarn);
+
+    // Pair files cannot be saved to from this node: mark them, and say so when
+    // the current target is one (nothing is being saved then).
+    function syncSaveTo() {
+        for (const opt of savetoOpts) {
+            const readOnly = pairFiles.has(opt.value);
+            opt.disabled = readOnly;
+            opt.textContent = pathBasename(opt.value) + (readOnly ? " (pair file, read-only)" : "");
+        }
+        const blocked = pairFiles.has(savePath);
+        savetoWarn.hidden = !blocked;
+        savetoWarn.textContent = blocked ? "not saving — pick a prompt file" : "";
+        savetoWarn.title = blocked
+            ? "This file holds prompt pairs. The node reads it but does not save prompts into it."
+            : "";
+    }
+    fetchFileInfo(adapter, [...new Set([...allPaths, savePath])]).then(info => {
+        if (!info || closed) return;
+        pairFiles = new Set(Object.keys(info).filter(path => info[path]?.pairs > 0));
+        syncSaveTo();
+    });
 
     // Search
     const searchRow = el("div", "ph-search-row");
@@ -671,7 +969,7 @@ function openPanel(node, adapter) {
 
     // Footer
     const footer    = el("div", "ph-footer");
-    const recentBtn = btn("ph-btn", "Recent ▾", () => toggleRecent());
+    const recentBtn = btn("ph-btn", "Recent queues ▾", () => toggleRecent());
     const selInfo   = el("span", "ph-sel-info");
     const selCount  = el("span", "");
     const showSelBtn = btn("ph-link", "Show selected", () => {
@@ -723,7 +1021,7 @@ function openPanel(node, adapter) {
         busy = on;
         // Closing mid-run would hide whether the batch went through, so the
         // close buttons wait as well (Esc is ignored while busy).
-        for (const b of [queueBtn, delSelBtn, recentBtn, allBtn, doneBtn, closeBtn]) b.disabled = on;
+        for (const b of [queueBtn, delSelBtn, recentBtn, allBtn, doneBtn, closeBtn, ...recentButtons]) b.disabled = on;
     }
 
     // ── Rows ──
@@ -764,10 +1062,16 @@ function openPanel(node, adapter) {
             badge.title = item.source;
             row.appendChild(badge);
         }
+        if (item.from_pair) {
+            const half = pairSide ?? "positive";
+            const tag = el("span", "ph-badge ph-pair", `pair · ${half.slice(0, 3)}`);
+            tag.title = `The ${half} half of a prompt pair. Pairs are changed and deleted in the pair node.`;
+            row.appendChild(tag);
+        }
         const runBtn = btn("ph-row-btn ph-run", "▶");
         runBtn.title = "Queue this one now, without loading it into the node  (Ctrl+Enter)";
         row.appendChild(runBtn);
-        if (item.source) {
+        if (item.source && !item.from_pair) {
             const delBtn = btn("ph-row-btn ph-del", "✕");
             delBtn.title = "Remove from history (can be undone for a few seconds)";
             row.appendChild(delBtn);
@@ -901,13 +1205,15 @@ function openPanel(node, adapter) {
             head.appendChild(el("span", "ph-preview-label", fields.length > 1 ? f.label : ""));
             if (value) {
                 const copy = btn("ph-copy", "Copy", async () => {
-                    try {
-                        await navigator.clipboard.writeText(value);
+                    const copied = await copyText(value);
+                    if (copied) {
                         copy.textContent = "Copied";
-                    } catch {
-                        copy.textContent = "Copy failed";
+                    } else {
+                        // Last resort: select the text so the keyboard shortcut copies it.
+                        selectContents(text);
+                        copy.textContent = "Press Ctrl+C";
                     }
-                    setTimeout(() => { copy.textContent = "Copy"; }, 1200);
+                    setTimeout(() => { copy.textContent = "Copy"; }, copied ? 1200 : 3000);
                 });
                 head.appendChild(copy);
             }
@@ -1029,12 +1335,15 @@ function openPanel(node, adapter) {
     async function loadItem(item) {
         if (!item || closed || busy) return;
         busy = true;   // a second click must not load twice
-        try {
-            const payload = { history_path: savePath, max_entries: getMaxEntries(node, adapter) };
-            for (const f of fields) payload[f.name] = item[f.name] ?? "";
-            await postJson(adapter.endpoints.save, payload);
-        } catch (err) {
-            console.error(`[${adapter.tag}] immediate save failed:`, err);
+        // A pair file is never written to from this node; the backend would refuse.
+        if (!pairFiles.has(savePath)) {
+            try {
+                const payload = { history_path: savePath, max_entries: getMaxEntries(node, adapter) };
+                for (const f of fields) payload[f.name] = item[f.name] ?? "";
+                await postJson(adapter.endpoints.save, payload);
+            } catch (err) {
+                console.error(`[${adapter.tag}] immediate save failed:`, err);
+            }
         }
         for (const f of fields) setWidgetValue(node, f.name, item[f.name] ?? "");
         busy = false;
@@ -1086,9 +1395,10 @@ function openPanel(node, adapter) {
         }
     }
 
-    async function queueBatchAgain(batch) {
+    // Unlike Queue N, this leaves the panel and the Recent list open, so several
+    // batches can be queued one after the other.
+    async function queueBatchAgain(batch, row, titleEl) {
         if (busy) return;
-        toggleRecent(false);
         setBusy(true);
         setStatus("");
         const res = await runQueue(node, adapter, batch.items, (done, total) => {
@@ -1101,9 +1411,20 @@ function openPanel(node, adapter) {
             setStatus(`Queued ${res.queued} of ${res.total}. ${res.error.message}`, true);
             return;
         }
-        batches.add(batch.items);
-        close();
-        toast("success", "Prompt History", `Queued ${res.total} ${plural(adapter, res.total)}`);
+        setStatus(`Queued ${res.total} ${plural(adapter, res.total)}`);
+        // Storage moves the batch to the top, but the list on screen keeps its
+        // order: re-sorting right after a click would put a different batch
+        // under the pointer. The row is only updated in place.
+        const fresh = batches.add(batch.items);
+        if (fresh) {
+            batch.id = fresh.id;
+            batch.ts = fresh.ts;
+            titleEl.textContent = batchTitle(adapter, batch);
+        }
+        if (row.isConnected) {
+            row.classList.add("ph-flash");
+            setTimeout(() => row.classList.remove("ph-flash"), 900);
+        }
     }
 
     // ── Recent batches ──
@@ -1111,17 +1432,17 @@ function openPanel(node, adapter) {
         if (!show) { recentBox.hidden = true; return; }
         const list = batches.list();
         recentBox.textContent = "";
+        recentButtons = [];
         recentBox.appendChild(el("div", "ph-recent-head", list.length
-            ? "Recent queue batches — click one to tick its entries again"
-            : "Batches you queue from this panel will be listed here."));
+            ? "Recent queues — click one to tick its entries again"
+            : "What you queue with Queue N will be listed here."));
         for (const batch of list) {
             const row  = el("div", "ph-recent-row");
             const main = el("div", "ph-recent-main");
-            main.append(
-                el("div", "ph-recent-title", batchTitle(adapter, batch)),
-                el("div", "ph-recent-sub", batchPreview(adapter, batch, 90)),
-            );
+            const titleEl = el("div", "ph-recent-title", batchTitle(adapter, batch));
+            main.append(titleEl, el("div", "ph-recent-sub", batchPreview(adapter, batch, 90)));
             row.onclick = () => {
+                if (busy) return;
                 sel.replace(batch.items);
                 showSelected = true;
                 activeIdx = -1;
@@ -1130,15 +1451,17 @@ function openPanel(node, adapter) {
             };
             const again = btn("ph-btn small primary", "Queue again", e => {
                 e.stopPropagation();
-                queueBatchAgain(batch);
+                queueBatchAgain(batch, row, titleEl);
             });
-            again.title = "Queue these entries now, with the workflow's current settings";
+            again.title = "Queue these entries now, with the workflow's current settings. The panel stays open.";
             const forget = btn("ph-mgr-del", "×", e => {
                 e.stopPropagation();
+                if (busy) return;
                 batches.remove(batch.id);
                 toggleRecent(true);
             });
             forget.title = "Forget this batch";
+            recentButtons.push(again, forget);
             row.append(main, again, forget);
             recentBox.appendChild(row);
         }
@@ -1158,7 +1481,7 @@ function openPanel(node, adapter) {
             if (!groups.has(item.source)) groups.set(item.source, []);
             groups.get(item.source).push(item.key);
         }
-        if (!groups.size) return;
+        if (!groups.size) return true;
 
         const done = [];
         let failure = null;
@@ -1171,24 +1494,37 @@ function openPanel(node, adapter) {
                 console.error(`[${adapter.tag}] delete:`, err);
             }
         }
-        if (closed) return;
+        if (closed) return !failure;
         for (const item of list) sel.remove(item.key);
         const n = done.reduce((sum, g) => sum + g.removed.length, 0);
         if (n) showUndo(`Deleted ${n} ${plural(adapter, n)}`, done);
         if (failure) setStatus(`Delete failed: ${failure.message ?? failure}`, true);
         doSearch({ keepScroll: true });
+        return !failure;
     }
 
-    function deleteSelected() {
+    async function deleteSelected() {
         if (busy) return;
-        const list = sel.items().filter(it => it.source);
+        const ticked = sel.items();
+        // Halves of pairs belong to the pair node; this node never removes them.
+        const list   = ticked.filter(it => it.source && !it.from_pair);
+        const skip   = ticked.filter(it => it.from_pair).length;
+        const skipNote = skip
+            ? `${skip} from pair files ${skip === 1 ? "was" : "were"} not deleted (delete pairs in the pair node)`
+            : "";
         if (!list.length) {
-            setStatus("The ticked entries are no longer tied to a history file.", true);
+            setStatus(skip
+                ? "Entries from pair files can only be deleted in the pair node."
+                : "The ticked entries are no longer tied to a history file.", true);
             return;
         }
         const n = list.length;
-        if (!confirm(`Delete ${n} ticked ${plural(adapter, n)} from history?\n\nYou can undo this for a few seconds afterwards.`)) return;
-        deleteItems(list);
+        const ask = `Delete ${n} ticked ${plural(adapter, n)} from history?`
+            + (skip ? `\n\n${skip} ticked ${plural(adapter, skip)} from pair files will be left alone.` : "")
+            + "\n\nYou can undo this for a few seconds afterwards.";
+        if (!confirm(ask)) return;
+        const ok = await deleteItems(list);
+        if (ok && skipNote && !closed) setStatus(skipNote);
     }
 
     function showUndo(text, groups) {
@@ -1236,6 +1572,7 @@ function openPanel(node, adapter) {
             max_results:    PAGE_SIZE,
         };
         if (adapter.scopes) body.search_in = opts.searchIn;
+        if (pairSide) body.pair_side = pairSide;
         return postJson(adapter.endpoints.list, body);
     }
 
@@ -1373,7 +1710,7 @@ function attachToNode(node, adapter) {
     const textWidgets = adapter.fields.map(f => getWidget(node, f.name)).filter(Boolean);
 
     // Hide widgets managed exclusively through the panel buttons
-    for (const name of ["history_paths", "save_to_path", "active_paths", "max_entries"]) {
+    for (const name of ["history_paths", "save_to_path", "active_paths", "max_entries", "pair_side"]) {
         const w = getWidget(node, name);
         if (!w) continue;
         // Current frontends (canvas and Vue node renderers) honour the hidden flag.
@@ -1582,7 +1919,7 @@ export function registerHistoryNode(adapter) {
             };
         },
 
-        // Right-click a node → repeat one of the recent queue batches.
+        // Right-click a node → repeat one of the recent queues.
         getNodeMenuItems(node) {
             if (node?.type !== adapter.nodeType) return [];
             const list = batchStore(adapter).list();
@@ -1590,7 +1927,7 @@ export function registerHistoryNode(adapter) {
             return [
                 null,
                 {
-                    content: "Repeat queue batch",
+                    content: "Repeat a recent queue",
                     has_submenu: true,
                     submenu: {
                         options: list.map(batch => ({

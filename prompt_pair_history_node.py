@@ -196,17 +196,10 @@ def _list_response(body: Dict[str, Any]) -> Dict[str, Any]:
         use_regex=bool(body.get("use_regex", False)),
     )
 
-    merged: List[Dict[str, Any]] = []
-    seen: set = set()
+    # One entry per key; for a pair stored in several files the newest copy wins.
     with _PAIR_LOCK:
-        for path in history_paths:
-            if not isinstance(path, str):
-                continue
-            for item in _load_pair_history(path):
-                k = item.get("key")
-                if k and k not in seen:
-                    seen.add(k)
-                    merged.append({**item, "source": path})
+        per_file = [(path, _load_pair_history(path)) for path in history_paths if isinstance(path, str)]
+    merged = _common.merge_newest(per_file)
 
     total = len(merged)
 

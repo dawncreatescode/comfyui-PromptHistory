@@ -26,6 +26,7 @@ registerHistoryNode({
     widgetOrder: [
         "mode", "text", "auto_save",
         "history_paths", "save_to_path", "active_paths", "max_entries",
+        "pair_side",
     ],
 
     endpoints: {
@@ -34,6 +35,8 @@ registerHistoryNode({
         delete:  "/prompt_history/delete",
         restore: "/prompt_history/restore",
         clear:   "/prompt_history/clear",
+        // Pair files can be used as sources (read-only); this tells them apart.
+        info:    "/select_prompt_history/file_info",
     },
 
     labels: {

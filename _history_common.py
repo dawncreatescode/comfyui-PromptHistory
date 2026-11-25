@@ -87,6 +87,30 @@ def page_bounds(body: Dict[str, Any], default_size: int = 300) -> Tuple[int, int
     return max(0, offset), max(1, min(MAX_PAGE_SIZE, size))
 
 
+def merge_newest(
+    per_file: Iterable[Tuple[str, List[Dict[str, Any]]]],
+) -> List[Dict[str, Any]]:
+    """Merge the entries of several history files into one list, one per key.
+
+    The same prompt often exists in more than one file (a random run copies its
+    pick into the "save to" file). The copy with the newest ``ts`` is kept, so
+    a prompt that was just used sorts to the top whatever order the files are
+    listed in; the first copy met wins ties. Every returned entry is a copy
+    tagged with the file it came from as ``source``.
+    """
+    best: Dict[Any, Dict[str, Any]] = {}
+    for path, items in per_file:
+        for item in items:
+            key = item.get("key")
+            if not key or not isinstance(key, (str, int)):
+                continue
+            current = best.get(key)
+            if current is None or str(item.get("ts", "")) > str(current.get("ts", "")):
+                # Re-assigning an existing key keeps its place in the dict order.
+                best[key] = {**item, "source": path}
+    return list(best.values())
+
+
 def keys_from_body(body: Dict[str, Any]) -> List[str]:
     """Collect the keys of a delete request: ``key`` (single) and/or ``keys`` (batch)."""
     keys: List[str] = []
@@ -102,8 +126,12 @@ def keys_from_body(body: Dict[str, Any]) -> List[str]:
 def remove_keys(
     items: List[Dict[str, Any]],
     keys: Iterable[str],
+    only: Callable[[Dict[str, Any]], bool] | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Drop the entries whose key is in ``keys``.
+
+    ``only`` limits what may be removed: entries it returns False for are kept
+    even when their key is listed.
 
     Returns ``(kept, removed)`` where ``removed`` is a list of
     ``{"index": original_position, "entry": entry}`` so the deletion can be undone.
@@ -112,7 +140,7 @@ def remove_keys(
     kept: List[Dict[str, Any]] = []
     removed: List[Dict[str, Any]] = []
     for i, item in enumerate(items):
-        if item.get("key") in wanted:
+        if item.get("key") in wanted and (only is None or only(item)):
             removed.append({"index": i, "entry": item})
         else:
             kept.append(item)

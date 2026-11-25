@@ -8,13 +8,18 @@ Modes:
   random      — pick a random prompt from active history files
   sequential  — cycle through active history files in order
 
+Files written by the pair node can be used as sources too: this node then
+offers one half of every pair (``pair_side``). Such files are read-only here;
+nothing this node does adds to, changes or removes a pair entry.
+
 HTTP endpoints:
   POST /select_prompt_history/list   — search & merge across multiple files
   GET  /select_prompt_history/scan   — discover JSON files in the node folder
+  POST /select_prompt_history/file_info — own prompts / pair entries per file
   POST /prompt_history/save          — upsert a prompt into a file
   POST /prompt_history/delete        — remove one prompt (key) or several (keys)
   POST /prompt_history/restore       — undo a delete
-  POST /prompt_history/clear         — wipe all prompts from a file
+  POST /prompt_history/clear         — delete all prompts from a file (pairs stay)
 
 License: MIT
 """
@@ -78,7 +83,23 @@ def _history_path_error(path: Any) -> str | None:
     return None
 
 
-def _load_history(path: str) -> List[Dict[str, Any]]:
+_PAIR_SIDES = ("positive", "negative")
+_PAIR_FILE_ERROR = (
+    "this file holds prompt pairs; the single-prompt node only reads it. "
+    "Choose another file under 'Save to'."
+)
+
+
+def _pair_side(value: Any) -> str:
+    return value if value in _PAIR_SIDES else "positive"
+
+
+def _load_raw(path: str) -> List[Dict[str, Any]]:
+    """Every entry of a history file, untouched.
+
+    Includes entries this node does not own (prompt pairs). Everything that
+    writes a file starts from this list, so those entries are never dropped.
+    """
     abs_path = _resolve_path(path)
     if not os.path.exists(abs_path):
         return []
@@ -86,10 +107,65 @@ def _load_history(path: str) -> List[Dict[str, Any]]:
         with open(abs_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict) and x.get("text")]
+            return [x for x in data if isinstance(x, dict)]
         return []
     except Exception:
         return []
+
+
+def _is_own(entry: Dict[str, Any]) -> bool:
+    """A single-prompt entry, the kind this node writes."""
+    text = entry.get("text")
+    return isinstance(text, str) and bool(text)
+
+
+def _is_pair(entry: Dict[str, Any]) -> bool:
+    """A prompt-pair entry written by the pair node."""
+    return not _is_own(entry) and bool(entry.get("positive") or entry.get("negative"))
+
+
+def _has_pairs(raw: List[Dict[str, Any]]) -> bool:
+    return any(_is_pair(x) for x in raw)
+
+
+def _view(raw: List[Dict[str, Any]], pair_side: str = "positive") -> List[Dict[str, Any]]:
+    """What this node offers from a file, in file order.
+
+    Its own prompts as they are, plus the chosen half of every pair as a
+    read-only entry (``from_pair``). A half is keyed by its text, so pairs that
+    share it (typically the same negative) collapse into one entry, and it
+    merges with the same prompt stored as a single entry elsewhere.
+    """
+    pair_side = _pair_side(pair_side)
+    own_keys = {x.get("key") for x in raw if _is_own(x)}
+    out: List[Dict[str, Any]] = []
+    derived: Dict[str, int] = {}   # key -> position in ``out``
+    for x in raw:
+        if _is_own(x):
+            out.append(x)
+            continue
+        if not _is_pair(x):
+            continue
+        half = x.get(pair_side)
+        if not isinstance(half, str) or not half.strip():
+            continue
+        half = half.strip()
+        key = _hash_text(half)
+        if key in own_keys:
+            continue   # the file's own copy of this prompt is the one to show
+        entry = {"key": key, "text": half, "ts": x.get("ts", ""), "hits": x.get("hits", 1), "from_pair": True}
+        at = derived.get(key)
+        if at is None:
+            derived[key] = len(out)
+            out.append(entry)
+        elif str(entry["ts"]) > str(out[at].get("ts", "")):
+            out[at] = entry
+    return out
+
+
+def _load_history(path: str, pair_side: str = "positive") -> List[Dict[str, Any]]:
+    """The prompts a file offers to this node (see :func:`_view`). Read-only use."""
+    return _view(_load_raw(path), pair_side)
 
 
 def _save_history(path: str, items: List[Dict[str, Any]]) -> None:
@@ -123,21 +199,55 @@ def _upsert(
     text: str,
     max_entries: int = 10_000,
 ) -> List[Dict[str, Any]]:
+    """Add ``text`` to the raw entries of a file, or move it to the top."""
     text = text.strip()
     if not text:
         return items
     key = _hash_text(text)
     items = list(items)
     for i, item in enumerate(items):
-        if item.get("key") == key:
+        if item.get("key") == key and _is_own(item):
             old = items.pop(i)
             items.insert(0, {"key": key, "text": text, "ts": _now_iso(), "hits": old.get("hits", 1) + 1})
             break
     else:
         items.insert(0, {"key": key, "text": text, "ts": _now_iso(), "hits": 1})
-    if max_entries > 0:
-        items = items[:max_entries]
+    if max_entries > 0 and len(items) > max_entries:
+        # The limit is on this node's prompts; other entries are not its to drop.
+        kept: List[Dict[str, Any]] = []
+        own = 0
+        for item in items:
+            if _is_own(item):
+                own += 1
+                if own > max_entries:
+                    continue
+            kept.append(item)
+        items = kept
     return items
+
+
+def _save_prompt(path: str, text: str, max_entries: int) -> str | None:
+    """Upsert ``text`` into ``path``. Call with _HIST_LOCK held.
+
+    Returns an error message instead of writing when the file holds prompt
+    pairs: a plain prompt saved there would show up in the pair node as a
+    positive-only pair.
+    """
+    raw = _load_raw(path)
+    if _has_pairs(raw):
+        return _PAIR_FILE_ERROR
+    _save_history(path, _upsert(raw, text, max_entries=max_entries))
+    return None
+
+
+_warned_pair_targets: set = set()
+
+
+def _warn_pair_target(path: str) -> None:
+    if path in _warned_pair_targets:
+        return
+    _warned_pair_targets.add(path)
+    print(f"[SelectPromptHistory] not saving to {path}: {_PAIR_FILE_ERROR}")
 
 
 def _clean_entry(entry: Any) -> Dict[str, Any] | None:
@@ -157,6 +267,7 @@ def _list_response(body: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(history_paths, list):
         history_paths = []
     sort_by = body.get("sort_by", "recent")
+    pair_side = _pair_side(body.get("pair_side"))
     offset, size = _common.page_bounds(body)
     matchers = _common.build_term_matchers(
         body.get("query", ""),
@@ -165,18 +276,10 @@ def _list_response(body: Dict[str, Any]) -> Dict[str, Any]:
         use_regex=bool(body.get("use_regex", False)),
     )
 
-    # Load and merge from all requested paths, tagging each item with its source
-    merged: List[Dict[str, Any]] = []
-    seen: set = set()
+    # One entry per key; for a prompt stored in several files the newest copy wins.
     with _HIST_LOCK:
-        for path in history_paths:
-            if not isinstance(path, str):
-                continue
-            for item in _load_history(path):
-                k = item.get("key")
-                if k and k not in seen:
-                    seen.add(k)
-                    merged.append({**item, "source": path})
+        per_file = [(path, _load_history(path, pair_side)) for path in history_paths if isinstance(path, str)]
+    merged = _common.merge_newest(per_file)
 
     total = len(merged)
 
@@ -203,6 +306,8 @@ def _list_response(body: Dict[str, Any]) -> Dict[str, Any]:
                 "ts":      it.get("ts", ""),
                 "hits":    it.get("hits", 1),
                 "source":  it.get("source", ""),
+                # Half of a pair: can be used, but not deleted from this node.
+                "from_pair": bool(it.get("from_pair")),
             }
             for it in merged[offset:offset + size]
         ],
@@ -210,9 +315,9 @@ def _list_response(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _delete_entries(path: str, keys: List[str]) -> List[Dict[str, Any]]:
-    """Remove entries by key; returns what was removed (with positions) for undo."""
+    """Remove this node's entries by key; returns what was removed (with positions) for undo."""
     with _HIST_LOCK:
-        kept, removed = _common.remove_keys(_load_history(path), keys)
+        kept, removed = _common.remove_keys(_load_raw(path), keys, only=_is_own)
         if removed:
             _save_history(path, kept)
     return removed
@@ -221,10 +326,37 @@ def _delete_entries(path: str, keys: List[str]) -> List[Dict[str, Any]]:
 def _restore_entries(path: str, removed: Any) -> int:
     """Put back entries returned by :func:`_delete_entries`."""
     with _HIST_LOCK:
-        items, restored = _common.restore_removed(_load_history(path), removed, _clean_entry)
+        items, restored = _common.restore_removed(_load_raw(path), removed, _clean_entry)
         if restored:
             _save_history(path, items)
     return restored
+
+
+def _clear_entries(path: str) -> int:
+    """Delete every prompt of this node from a file; pair entries stay. Returns the number removed."""
+    with _HIST_LOCK:
+        raw = _load_raw(path)
+        kept = [x for x in raw if not _is_own(x)]
+        if len(kept) != len(raw):
+            _save_history(path, kept)
+    return len(raw) - len(kept)
+
+
+def _file_info(paths: Any) -> Dict[str, Dict[str, int]]:
+    """Per file: how many prompts are this node's own, and how many pair entries it holds."""
+    info: Dict[str, Dict[str, int]] = {}
+    if not isinstance(paths, list):
+        return info
+    with _HIST_LOCK:
+        for path in paths:
+            if not isinstance(path, str) or path in info:
+                continue
+            raw = _load_raw(path)
+            info[path] = {
+                "own":   sum(1 for x in raw if _is_own(x)),
+                "pairs": sum(1 for x in raw if _is_pair(x)),
+            }
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +435,10 @@ class SelectPromptHistoryNode:
                     "INT",
                     {"default": 500_000, "min": 1, "max": 10_000_000},
                 ),
+                # Which half of a pair to use from files written by the pair
+                # node. Hidden; set in "Manage Files…". Keep new inputs last so
+                # the positional widget values of older workflows stay valid.
+                "pair_side": (list(_PAIR_SIDES), {"default": "positive"}),
             },
         }
 
@@ -327,6 +463,7 @@ class SelectPromptHistoryNode:
         save_to_path: str = _DEFAULT_HISTORY_PATH,
         active_paths: str = "",
         max_entries: int = 500_000,
+        pair_side: str = "positive",
     ):
         all_paths = _parse_paths(history_paths) or [_DEFAULT_HISTORY_PATH]
         active_list = _parse_active(active_paths)
@@ -341,7 +478,7 @@ class SelectPromptHistoryNode:
             merged: List[Dict[str, Any]] = []
             seen: set = set()
             for path in (effective_paths if auto_mode else ()):
-                for item in _load_history(path):
+                for item in _load_history(path, pair_side):
                     k = item.get("key")
                     if k and k not in seen:
                         seen.add(k)
@@ -359,8 +496,8 @@ class SelectPromptHistoryNode:
 
             if auto_save and used_text:
                 save = save_to_path.strip() or all_paths[0]
-                existing = _load_history(save)
-                _save_history(save, _upsert(existing, used_text, max_entries=max_entries))
+                if _save_prompt(save, used_text, max_entries):
+                    _warn_pair_target(save)
 
         conditioning = None
         if clip is not None:
@@ -411,6 +548,14 @@ def _register_select_routes() -> None:
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
+    @routes.post("/select_prompt_history/file_info")
+    async def _sph_file_info(request):
+        try:
+            body = await request.json()
+            return web.json_response({"ok": True, "files": _file_info(body.get("paths"))})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     @routes.post("/prompt_history/save")
     async def _ph_save(request):
         try:
@@ -424,7 +569,9 @@ def _register_select_routes() -> None:
             if err:
                 return web.json_response({"ok": False, "error": err}, status=400)
             with _HIST_LOCK:
-                _save_history(path, _upsert(_load_history(path), text, max_entries=max_entries))
+                err = _save_prompt(path, text, max_entries)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
             return web.json_response({"ok": True})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
@@ -463,9 +610,7 @@ def _register_select_routes() -> None:
             err = _history_path_error(path)
             if err:
                 return web.json_response({"ok": False, "error": err}, status=400)
-            with _HIST_LOCK:
-                _save_history(path, [])
-            return web.json_response({"ok": True})
+            return web.json_response({"ok": True, "removed": _clear_entries(path)})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 

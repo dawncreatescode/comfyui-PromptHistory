@@ -62,6 +62,8 @@ const CSS = `
 /* ── Save-to ── */
 .ph-saveto-row { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
 .ph-saveto-label { font-size: 11px; opacity: 0.45; flex-shrink: 0; }
+.ph-saveto-warn  { font-size: 11px; color: #e0b070; white-space: nowrap; }
+.ph-saveto-warn[hidden] { display: none; }
 .ph-saveto {
     flex: 1; padding: 3px 8px; font-size: 11px;
     background: var(--comfy-input-bg, #2b2b2b);
@@ -99,7 +101,7 @@ const CSS = `
 }
 .ph-toggle:hover  { filter: brightness(1.18); }
 .ph-toggle.active { background: #1e4a7a; border-color: #4a7aaa; color: #cde; }
-.ph-scope, .ph-sort {
+.ph-scope, .ph-sort, .ph-mgr-select {
     padding: 3px 8px; font-size: 11px;
     background: var(--comfy-input-bg, #2b2b2b);
     border: 1px solid var(--border-color, #555);
@@ -217,6 +219,7 @@ const CSS = `
     background: rgba(255,255,255,0.07); color: rgba(221,221,221,0.45);
     max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.ph-badge.ph-pair { background: rgba(120,150,220,0.16); color: rgba(190,205,240,0.8); max-width: none; }
 
 /* ── Row buttons: queue this one, delete ── */
 .ph-row-btn {
@@ -298,6 +301,7 @@ const CSS = `
     border-top: 1px solid rgba(255,255,255,0.05);
 }
 .ph-recent-row:hover { background: rgba(255,255,255,0.06); }
+.ph-recent-row.ph-flash { background: rgba(70,150,90,0.30); transition: background 0.2s; }
 .ph-recent-main { flex: 1; min-width: 0; }
 .ph-recent-title { font-size: 12px; }
 .ph-recent-sub {
@@ -323,7 +327,27 @@ const CSS = `
 }
 .ph-mgr-del:hover { opacity: 1; background: rgba(200,80,80,0.18); }
 .ph-mgr-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.ph-mgr-toggle {
+    background: none; border: none; color: inherit; cursor: pointer;
+    font-size: 12px; padding: 2px 0; opacity: 0.6; text-align: left;
+}
+.ph-mgr-toggle:hover { opacity: 1; }
+.ph-mgr-danger { margin-top: 6px; }
+.ph-mgr-count { font-size: 11px; opacity: 0.5; flex: 1; white-space: nowrap; }
+.ph-mgr-armed {
+    background: rgba(160,40,40,0.16); border: 1px solid rgba(200,80,80,0.35);
+    border-radius: 6px; padding: 6px 8px; margin: 2px 0;
+}
+.ph-mgr-ask { flex: 1; font-size: 12px; line-height: 1.4; color: #fbb; }
 .ph-mgr-add-row { display: flex; gap: 6px; }
+.ph-mgr-tag {
+    font-size: 10px; padding: 1px 7px; border-radius: 10px; flex-shrink: 0; white-space: nowrap;
+    background: rgba(120,150,220,0.16); color: rgba(190,205,240,0.85);
+}
+.ph-mgr-note { font-size: 11px; line-height: 1.4; color: #e0b070; padding: 4px 0 2px; }
+.ph-mgr-side { display: flex; align-items: center; gap: 8px; }
+.ph-mgr-side[hidden] { display: none; }
+.ph-mgr-side .ph-mgr-label { margin-bottom: 0; }
 
 /* ── Search highlight ── */
 mark.ph-highlight {

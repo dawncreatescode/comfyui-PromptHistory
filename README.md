@@ -66,7 +66,8 @@ Click **Select Prompts…** on the node to open it.
 - **Search scope** (pair node only) — a dropdown next to the toggles chooses whether the query matches the positive prompt (default), the negative prompt, or both.
 - **Source chips** switch individual history files on and off. The same choice decides which files `random` and `sequential` draw from.
 - **Save to** picks the file that receives new prompts.
-- Hover a row (or use the arrow keys) to read the full prompt in the preview on the right, with a **Copy** button.
+- Hover a row (or use the arrow keys) to read the full prompt in the preview on the right, with a **Copy** button. Copy also works when ComfyUI is opened over plain `http://` from another machine.
+- A prompt that exists in several files is listed once, with the date of its most recent use, so what `random` just picked is at the top of the **↓ Recent** order.
 - The list loads 300 entries at a time and fetches more as you scroll; the counter shows how many match in total.
 - Sort order, search toggles and panel size are remembered in your browser.
 
@@ -91,15 +92,15 @@ The node's own text and mode are put back after queueing. If ComfyUI rejects a r
 
 ### Repeating a batch
 
-**Recent ▾** lists the last 10 batches you queued. Click one to tick its prompts again, or press **Queue again** to run it immediately. The prompts are queued with the workflow's *current* settings, so this is the quick way to rerun a set with a different seed or sampler. The same list is in the node's right-click menu under **Repeat queue batch**.
+**Recent queues ▾** lists the last 10 batches you queued. Click one to tick its prompts again, or press **Queue again** to run it immediately. The panel and the list stay open after **Queue again**, so you can queue several batches in a row. The prompts are queued with the workflow's *current* settings, so this is the quick way to rerun a set with a different seed or sampler. The same list is in the node's right-click menu under **Repeat a recent queue**.
 
-Recent batches are stored in your browser, not in the history files.
+Recent queues are stored in your browser, not in the history files.
 
 ### Deleting
 
 - **✕** on a row removes that prompt. An **Undo** bar stays for a few seconds.
 - **Delete N…** removes all ticked prompts after a confirmation, with the same Undo.
-- Wiping a whole file is under **Manage Files… → Clear…**.
+- Emptying a whole file is under **Manage Files… → Delete all prompts in a file…**. It shows how many prompts each file holds and asks once more before deleting; this cannot be undone.
 
 ### Keyboard
 
@@ -117,7 +118,21 @@ After using the arrow keys, just start typing to continue searching.
 
 ### Managing files
 
-**Manage Files…** on the node adds, removes, or discovers history files, and can clear a file.
+**Manage Files…** on the node adds, removes, or discovers history files.
+
+- **Remove from node** only stops the node from using a file; the file and its prompts stay on disk, and an **Undo** appears in case it was a misclick. To skip a file just for a while, use the source chips in the panel instead.
+- **Delete all prompts in a file…** is a separate, closed section at the bottom for emptying a file.
+
+### Using pair files in the single-prompt node
+
+Files written by the pair node can be added to **Select Prompt From History** like any other file. The node then offers one half of every pair as a prompt:
+
+- **Manage Files… → From pair files use: Positive / Negative** chooses the half. The setting is saved with the node, so one node can serve your positive prompts and another your negatives. Pairs that share the same text (typically the same negative) show up once.
+- Pair files are **read-only** in this node. It can load, queue and randomly pick from them, but it never saves into them and cannot delete from them; rows from a pair have a `pair` badge and no ✕. Change or delete pairs in the pair node.
+- Pair files are greyed out under **Save to**. If the node's only files are pair files, new prompts are not saved until you add a prompt file; the panel says so next to **Save to**.
+- When a pair's half is used (clicked, or picked by `random` / `sequential` with `auto_save` on), a copy is saved to the **Save to** file as an ordinary prompt.
+
+The other direction already worked: the pair node reads single-prompt files as positive-only pairs.
 
 ## Seeing what random and sequential used
 
